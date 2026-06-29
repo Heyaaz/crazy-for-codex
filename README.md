@@ -8,7 +8,8 @@ It keeps GJC as the worker and adds an external control/learning layer:
 - observable loop ledger (`ledger.jsonl`)
 - guarded GJC prompt generation and optional tmux injection
 - real git scope checks and verification command evidence
-- read-only review prompt generation
+- read-only review prompt generation and review-result classification
+- automatic `loop`: execute → check → clean review → repair → learn
 - LLM-Wiki-style learning candidates under `.cfc/wiki/`
 
 CfC does **not** mutate `.gjc/` state. `.gjc/` remains GJC runtime state; `.cfc/` is the external learning/control layer.
@@ -18,6 +19,25 @@ CfC does **not** mutate `.gjc/` state. `.gjc/` remains GJC runtime state; `.cfc/
 ```bash
 python3 scripts/cfc.py init --root /path/to/repo
 
+python3 scripts/cfc.py loop --root /path/to/repo \
+  "Fix small UI issue" \
+  --allow 'src/Foo.tsx' \
+  --verify 'npm run lint' \
+  --executor-target gjc:0.0 \
+  --reviewer-target gjc:0.1 \
+  --send \
+  --tmux-wait-seconds 120
+```
+
+The loop requires an executor adapter and an independent reviewer adapter. In tmux mode, pass `--send` with separate `--executor-target` / `--reviewer-target`. In non-interactive test/CI mode, pass `--executor-command` and `--reviewer-command`.
+
+The reviewer prompt includes `git status`, unstaged diff, staged diff, and small text untracked files so fresh review sees new files too.
+
+The loop creates a run, sends an executor prompt, checks the real diff and verification evidence, opens a fresh read-only reviewer prompt, classifies BLOCKER findings, sends a repair prompt when needed, repeats up to `--max-iterations`, then generates `LEARN.md` and `DONE.md` when clean.
+
+Manual primitives are also available:
+
+```bash
 python3 scripts/cfc.py start --root /path/to/repo \
   "Fix small UI issue" \
   --allow 'src/Foo.tsx' \
@@ -50,6 +70,9 @@ capture   capture GJC/tmux output into the run folder
 check     run git scope checks and verification commands
 diff      write DIFF.md from current git diff
 review    generate read-only independent review prompt
+classify-review parse REVIEW.iteration-N.md into BLOCKERS.md
+repair    generate/send repair-only prompt from current blockers
+loop      execute → check → fresh review → repair until blocker-free → learn
 park      add a note to PARKING_LOT.md
 learn     generate/apply LLM-Wiki-style learning candidates
 done      finalize a run after checks
@@ -68,7 +91,10 @@ events    print ledger.jsonl events
     PRECHECK.md
     PROMPT.iteration-1.md
     GJC_LOG.<time>.md
-    REVIEW_PROMPT.md
+    REVIEW_PROMPT.iteration-1.md
+    REVIEW.iteration-1.md
+    BLOCKERS.md
+    REPAIR_PROMPT.iteration-1.md
     DIFF.md
     CHECK.md
     LEARN.md

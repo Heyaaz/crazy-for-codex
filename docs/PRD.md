@@ -42,6 +42,7 @@ cfc init
 cfc start "task" --allow <path> --forbid <path> --verify "command"
 # refuses dirty worktrees by default; use --allow-dirty to accept baseline dirt
 # refuses to overwrite active runs by default; use --replace intentionally
+cfc loop "task" --allow <path> --verify "command" --executor-target gjc:0.0 --reviewer-target gjc:0.1 --send
 cfc status
 cfc gjc "request" [--send --tmux-target gjc:0.0]
 cfc capture [--tmux-target gjc:0.0]
@@ -53,6 +54,15 @@ cfc learn [--apply]
 cfc done [--force]
 cfc events
 ```
+
+## Loop Contract
+
+`cfc loop` requires both an executor and an independent reviewer adapter before it mutates a target repository. It refuses to run without either:
+
+- tmux mode: `--send --executor-target <tmux-pane> --reviewer-target <tmux-pane>`
+- command mode: `--executor-command <cmd> --reviewer-command <cmd>`
+
+The review evidence includes `git status`, unstaged diff, staged diff, and small text untracked files. Reviewer failure or empty reviewer output is treated as `REVIEW_BLOCKED`, never PASS.
 
 ## Data Model
 
@@ -66,7 +76,10 @@ cfc events
     PRECHECK.md
     PROMPT.iteration-1.md
     GJC_LOG.<time>.md
-    REVIEW_PROMPT.md
+    REVIEW_PROMPT.iteration-1.md
+    REVIEW.iteration-1.md
+    BLOCKERS.md
+    REPAIR_PROMPT.iteration-1.md
     DIFF.md
     CHECK.md
     LEARN.md
@@ -127,6 +140,8 @@ A run is done only when:
 
 - `cfc loop`: execute -> check -> review -> repair iterations.
 - `cfc repair`: generate repair-only prompt from BLOCKER findings.
+- command-agent mode for deterministic tests and non-interactive agent adapters.
+- tmux mode for existing GJC/Ghostty panes, with separate executor/reviewer targets.
 - coordinator adapter using `gjc_coordinator_*` tools instead of tmux.
 - read-only ingestion of `.gjc/ultragoal` and `.gjc/team` evidence.
 - stronger wiki retrieval by task tags.

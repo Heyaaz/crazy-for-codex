@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
+VERSION = "0.3.0"
 CFC_DIR = ".cfc"
 DEFAULT_FORBIDDEN_PATHS = [
     "AGENTS.md",
@@ -184,6 +184,43 @@ def git_diff(root: Path) -> str:
     return out if code == 0 else err
 
 
+def git_review_diff(root: Path, max_file_chars: int = 20000) -> str:
+    sections: list[str] = []
+    code, status, err = git_output(root, "status", "--short")
+    sections.append("## Git Status\n\n```text\n" + ((status if code == 0 else err).rstrip() or "(clean)") + "\n```")
+    code, unstaged, err = git_output(root, "diff")
+    sections.append("## Unstaged Diff\n\n```diff\n" + ((unstaged if code == 0 else err) or "(no unstaged diff)")[:50000] + "\n```")
+    code, staged, err = git_output(root, "diff", "--cached")
+    sections.append("## Staged Diff\n\n```diff\n" + ((staged if code == 0 else err) or "(no staged diff)")[:50000] + "\n```")
+    # Plain git diff omits untracked files; include small text untracked files so
+    # the clean reviewer can actually inspect new files.
+    code, untracked, _ = git_output(root, "ls-files", "--others", "--exclude-standard")
+    entries = []
+    if code == 0:
+        for rel in untracked.splitlines():
+            rel = rel.strip()
+            if not rel or ignored_status_path(rel):
+                continue
+            path = root / rel
+            if not path.is_file():
+                entries.append(f"### {rel}\n\n(non-file or directory)\n")
+                continue
+            try:
+                data = path.read_bytes()
+            except OSError as exc:
+                entries.append(f"### {rel}\n\n(unreadable: {exc})\n")
+                continue
+            if b"\0" in data:
+                entries.append(f"### {rel}\n\n(binary file omitted, {len(data)} bytes)\n")
+                continue
+            text = data.decode("utf-8", errors="replace")
+            truncated = len(text) > max_file_chars
+            suffix = "\n...<truncated>" if truncated else ""
+            entries.append(f"### {rel}\n\n```text\n{text[:max_file_chars]}{suffix}\n```\n")
+    sections.append("## Untracked Files\n\n" + ("\n".join(entries) if entries else "(none)"))
+    return "\n\n".join(sections)
+
+
 def load_config(root: Path) -> dict[str, Any]:
     path = cfc_path(root) / "config.json"
     return read_json(path, default={})
@@ -259,8 +296,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         (cfc / "wiki" / sub).mkdir(parents=True, exist_ok=True)
     config = {
         "version": 1,
-        "runner": {"type": "tmux", "tmux_target": "gjc:0.0"},
-        "loop": {"max_iterations": 3, "require_independent_review": True, "fail_on_blocker": True, "require_verification": False},
+        "runner": {"type": "tmux", "tmux_target": "gjc:0.0", "reviewer_target": "gjc:0.1"},
+        "loop": {"max_iterations": 3, "require_independent_review": True, "fail_on_blocker": True, "require_verification": False, "auto_learn": True},
         "learning": {"enabled": True, "mode": "suggest", "max_new_items_per_run": 3},
         "defaults": {
             "forbidden_paths": DEFAULT_FORBIDDEN_PATHS,
@@ -625,11 +662,9 @@ Required output:
 
 {(rd / 'TASK.md').read_text(encoding='utf-8') if (rd / 'TASK.md').exists() else run['title']}
 
-## Current Diff
+## Current Review Diff
 
-```diff
-{diff_text[:50000]}
-```
+{git_review_diff(root)}
 """
     path = rd / "REVIEW_PROMPT.md"
     path.write_text(prompt, encoding="utf-8")
@@ -656,7 +691,7 @@ def cmd_learn(args: argparse.Namespace) -> None:
     root = root_path(args)
     run, rd = active_run(root)
     check = (rd / "CHECK.md").read_text(encoding="utf-8", errors="ignore") if (rd / "CHECK.md").exists() else ""
-    review_files = [p for p in sorted(rd.glob("REVIEW*.md")) if p.name != "REVIEW_PROMPT.md"]
+    review_files = sorted(rd.glob("REVIEW.iteration-*.md"))
     review_text = "\n\n".join(p.read_text(encoding="utf-8", errors="ignore")[:8000] for p in review_files)
     candidates = derive_learn_candidates(run, check, review_text)
     learn_md = render_learn(run, candidates)
@@ -705,15 +740,8 @@ def derive_learn_candidates(run: dict[str, Any], check: str, review: str) -> lis
             "prevention": "Stop before editing any file outside allowed paths; ask for scope expansion instead.",
             "prompt_patch": "Do not edit outside allowed paths. If the task requires it, stop and explain the required scope expansion first.",
         })
-    review_lower = review.lower()
-    actual_review_blocker = (
-        "verdict: review_blocked" in review_lower
-        or "review_blocked" in review_lower
-        or "remaining blocker" in review_lower
-        or bool(re.search(r"(?im)^#+\s*blockers?\s*$\n\s*-\s*(?!(?:none|없음|\(none\))\s*$).+", review))
-        or bool(re.search(r"(?im)^blockers?\s*:\s*(?!(?:none|없음|\(none\))\s*$).+", review))
-    )
-    if actual_review_blocker:
+    parsed_review = parse_review_result(review) if review.strip() else {"verdict": "PASS", "blockers": []}
+    if parsed_review.get("verdict") == "REVIEW_BLOCKED" and parsed_review.get("blockers"):
         out.append({
             "type": "Runbook",
             "title": "Blocker repair loop",
@@ -840,6 +868,294 @@ Review CHECK.md and commit manually if the result is acceptable.
     print(done)
 
 
+def extract_review_result_name(iteration: int) -> str:
+    return f"REVIEW.iteration-{iteration}.md"
+
+
+def render_review_prompt(run: dict[str, Any], root: Path, rd: Path, iteration: int) -> str:
+    check_text = (rd / "CHECK.md").read_text(encoding="utf-8", errors="ignore") if (rd / "CHECK.md").exists() else "(CHECK.md missing)"
+    return f"""# CfC Independent Review Prompt
+
+Repository: {root}
+Run: {run['title']} ({run['id']})
+Iteration: {iteration}
+
+You are the independent read-only reviewer in a fresh, clean context.
+Do not edit, write, stage, commit, push, install dependencies, or format files.
+Review only the task contract, current diff, and verification evidence below.
+Ignore the executor's confidence; trust the diff and real evidence.
+
+Classify findings as:
+- BLOCKER: requirement mismatch, runtime breakage, failing verification, API/payload contract break, data/security risk, forbidden scope change.
+- MAJOR: important maintainability/test/edge-case issue that should be considered before merge.
+- MINOR: small cleanup.
+
+Required output format exactly:
+
+Verdict: PASS or REVIEW_BLOCKED
+
+## BLOCKERS
+- none
+
+## MAJOR
+- none
+
+## MINOR
+- none
+
+## Verification gaps
+- none
+
+## Suggested repair prompt
+- none unless REVIEW_BLOCKED
+
+## Task
+
+{(rd / 'TASK.md').read_text(encoding='utf-8') if (rd / 'TASK.md').exists() else run['title']}
+
+## Check Evidence
+
+```md
+{check_text[:20000]}
+```
+
+## Current Review Diff
+
+{git_review_diff(root)}
+"""
+
+
+def parse_review_result(text: str) -> dict[str, Any]:
+    if not text.strip():
+        return {"verdict": "REVIEW_BLOCKED", "blockers": ["review produced no output"], "major": [], "minor": []}
+    verdict_match = re.search(r"(?im)^\s*Verdict\s*:\s*([A-Z_]+)", text)
+    verdict = verdict_match.group(1).upper() if verdict_match else ("REVIEW_BLOCKED" if "REVIEW_BLOCKED" in text.upper() else "PASS")
+
+    def section_items(name: str) -> list[str]:
+        m = re.search(rf"(?ims)^##\s*{re.escape(name)}\s*$\n(.*?)(?=^##\s+|\Z)", text)
+        if not m:
+            # Also accept `BLOCKERS:` style.
+            m2 = re.search(rf"(?im)^\s*{re.escape(name)}\s*:\s*(.+)$", text)
+            if not m2:
+                return []
+            raw = m2.group(1).strip()
+            return [] if raw.lower() in {"none", "(none)", "없음", "n/a"} else [raw]
+        items = []
+        for line in m.group(1).splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.lower() in {"- none", "none", "- (none)", "(none)", "- 없음", "없음"}:
+                continue
+            if stripped.startswith("-"):
+                items.append(stripped.lstrip("- ").strip())
+            elif stripped:
+                items.append(stripped)
+        return items
+
+    blockers = section_items("BLOCKERS") or section_items("BLOCKER")
+    major = section_items("MAJOR")
+    minor = section_items("MINOR")
+    if verdict == "REVIEW_BLOCKED" and not blockers:
+        blockers = ["review returned REVIEW_BLOCKED without parsed BLOCKERS"]
+    blocked = verdict == "REVIEW_BLOCKED" or bool(blockers)
+    return {"verdict": "REVIEW_BLOCKED" if blocked else "PASS", "blockers": blockers, "major": major, "minor": minor}
+
+
+def latest_review_result(rd: Path) -> tuple[Path | None, dict[str, Any]]:
+    files = [p for p in sorted(rd.glob("REVIEW.iteration-*.md")) if p.is_file()]
+    if not files:
+        return None, {"verdict": "PASS", "blockers": [], "major": [], "minor": []}
+    path = files[-1]
+    return path, parse_review_result(path.read_text(encoding="utf-8", errors="ignore"))
+
+
+def render_blockers_md(review_path: Path | None, parsed: dict[str, Any]) -> str:
+    blockers = parsed.get("blockers", [])
+    return "# CfC Blockers\n\n" + f"Source review: `{review_path}`\n\n" + ("## BLOCKERS\n\n" + "\n".join(f"- {b}" for b in blockers) if blockers else "No BLOCKER findings.\n") + "\n"
+
+
+def render_repair_prompt(run: dict[str, Any], root: Path, rd: Path, iteration: int, blockers: list[str]) -> str:
+    blocker_text = "\n".join(f"- {b}" for b in blockers) or "- none"
+    return f"""# CfC Repair Prompt
+
+Repository: {root}
+Run: {run['title']} ({run['id']})
+Repair iteration: {iteration}
+
+Fix only the BLOCKER findings below.
+Do not broaden scope, refactor unrelated code, install dependencies, stage, commit, or push.
+Keep existing task contract and allowed/forbidden paths.
+After the repair, run the configured verification commands and report exact results.
+
+## BLOCKERS to fix
+
+{blocker_text}
+
+## Task Contract
+
+{(rd / 'TASK.md').read_text(encoding='utf-8') if (rd / 'TASK.md').exists() else run['title']}
+
+## Required final report
+
+1. Files changed
+2. Which BLOCKER each change fixes
+3. Verification commands and exact result
+4. Remaining risks/blockers
+"""
+
+
+def run_agent_command(command: str, prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, cwd=str(cwd), input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, timeout=timeout)
+
+
+def cmd_classify_review(args: argparse.Namespace) -> None:
+    root = root_path(args)
+    run, rd = active_run(root)
+    path = Path(args.review_file).expanduser().resolve() if args.review_file else latest_review_result(rd)[0]
+    if not path or not path.exists():
+        raise SystemExit("No REVIEW.iteration-*.md found. Pass --review-file or run cfc review/cfc loop first.")
+    parsed = parse_review_result(path.read_text(encoding="utf-8", errors="ignore"))
+    (rd / "BLOCKERS.md").write_text(render_blockers_md(path, parsed), encoding="utf-8")
+    run["review"] = {"verdict": parsed["verdict"], "blockers": parsed["blockers"], "review_file": str(path), "classified_at": now_iso()}
+    write_json(rd / "RUN.json", run)
+    append_ledger(rd, "review_classify", parsed["verdict"].lower(), blocker_count=len(parsed["blockers"]), review_file=str(path))
+    print(json.dumps(parsed, indent=2, ensure_ascii=False))
+
+
+def cmd_repair(args: argparse.Namespace) -> None:
+    root = root_path(args)
+    run, rd = active_run(root)
+    _, parsed = latest_review_result(rd)
+    blockers = parsed.get("blockers", []) or run.get("review", {}).get("blockers", [])
+    if not blockers:
+        raise SystemExit("No blockers found to repair.")
+    prompt = render_repair_prompt(run, root, rd, args.iteration, blockers)
+    path = rd / f"REPAIR_PROMPT.iteration-{args.iteration}.md"
+    path.write_text(prompt, encoding="utf-8")
+    append_ledger(rd, "repair_prompt", "done", iteration=args.iteration, blocker_count=len(blockers), path=str(path))
+    print(f"Wrote repair prompt: {path}")
+    if args.executor_command:
+        res = run_agent_command(args.executor_command, prompt, root, args.timeout)
+        out = rd / f"REPAIR_RESULT.iteration-{args.iteration}.md"
+        out.write_text(f"# Repair Result\n\nCommand: `{args.executor_command}`\nExit: `{res.returncode}`\n\n## stdout\n```text\n{res.stdout}\n```\n\n## stderr\n```text\n{res.stderr}\n```\n", encoding="utf-8")
+        append_ledger(rd, "repair_command", "pass" if res.returncode == 0 else "fail", iteration=args.iteration, exit_code=res.returncode, path=str(out))
+        print(f"Wrote repair result: {out}")
+        if res.returncode != 0:
+            raise SystemExit(res.returncode)
+    elif args.send:
+        target = args.tmux_target or run.get("runner", {}).get("target") or "gjc:0.0"
+        tmux_send(target, prompt)
+        append_ledger(rd, "repair_send", "sent", iteration=args.iteration, target=target, prompt=str(path))
+        print(f"Sent repair prompt to tmux target: {target}")
+
+
+def cmd_loop(args: argparse.Namespace) -> None:
+    root = root_path(args)
+    if not args.executor_command and not args.send:
+        raise SystemExit("cfc loop requires an executor adapter: pass --executor-command or use --send with --executor-target")
+    if not args.reviewer_command and not args.send:
+        raise SystemExit("cfc loop requires an independent reviewer: pass --reviewer-command or use --send with --reviewer-target")
+    if not cfc_path(root).exists():
+        cmd_init(argparse.Namespace(root=str(root)))
+    start_args = argparse.Namespace(
+        root=str(root), title=args.request, allow=args.allow, forbid=args.forbid, verify=args.verify,
+        tmux_target=args.executor_target, allow_dirty=args.allow_dirty, replace=args.replace,
+    )
+    cmd_start(start_args)
+    run, rd = active_run(root)
+    final_parsed = {"verdict": "UNKNOWN", "blockers": []}
+    for iteration in range(1, args.max_iterations + 1):
+        append_ledger(rd, "loop_iteration", "start", iteration=iteration)
+        if iteration == 1:
+            prompt = build_prompt(run, root, args.request, mode="execute")
+            prompt_path = rd / f"PROMPT.iteration-{iteration}.md"
+        else:
+            prompt_path = rd / f"REPAIR_PROMPT.iteration-{iteration - 1}.md"
+            if not prompt_path.exists():
+                prompt = build_prompt(run, root, f"Repair iteration {iteration}: fix only the blockers from BLOCKERS.md and preserve scope.", mode="repair")
+                prompt_path.write_text(prompt, encoding="utf-8")
+            else:
+                prompt = prompt_path.read_text(encoding="utf-8")
+        if not prompt_path.exists():
+            prompt_path.write_text(prompt, encoding="utf-8")
+        append_ledger(rd, "execute_prompt", "done", iteration=iteration, path=str(prompt_path))
+        if args.executor_command:
+            res = run_agent_command(args.executor_command, prompt, root, args.timeout)
+            out = rd / f"EXECUTION.iteration-{iteration}.md"
+            out.write_text(f"# Execution Result\n\nCommand: `{args.executor_command}`\nExit: `{res.returncode}`\n\n## stdout\n```text\n{res.stdout}\n```\n\n## stderr\n```text\n{res.stderr}\n```\n", encoding="utf-8")
+            append_ledger(rd, "execute_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode, path=str(out))
+            if res.returncode != 0:
+                run["status"] = "execute_failed"
+                write_json(rd / "RUN.json", run)
+                raise SystemExit(res.returncode)
+        elif args.send:
+            tmux_send(args.executor_target, prompt)
+            append_ledger(rd, "execute_send", "sent", iteration=iteration, target=args.executor_target)
+            if args.tmux_wait_seconds:
+                subprocess.run(["sleep", str(args.tmux_wait_seconds)], check=False)
+                cap = subprocess.run(["tmux", "capture-pane", "-t", args.executor_target, "-p", "-S", f"-{args.capture_lines}"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                (rd / f"GJC_LOG.iteration-{iteration}.md").write_text("# GJC Captured Log\n\n```text\n" + cap.stdout + "\n```\n", encoding="utf-8")
+        else:
+            print(f"Wrote executor prompt for iteration {iteration}: {prompt_path}")
+        cmd_diff(argparse.Namespace(root=str(root)))
+        cmd_check(argparse.Namespace(root=str(root)))
+        run, rd = active_run(root)
+        if run.get("check", {}).get("verdict") == "FAIL" and args.review_on_check_fail is False:
+            final_parsed = {"verdict": "REVIEW_BLOCKED", "blockers": run.get("check", {}).get("failures", [])}
+        else:
+            review_prompt = render_review_prompt(run, root, rd, iteration)
+            review_prompt_path = rd / f"REVIEW_PROMPT.iteration-{iteration}.md"
+            review_prompt_path.write_text(review_prompt, encoding="utf-8")
+            append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path))
+            if args.reviewer_command:
+                res = run_agent_command(args.reviewer_command, review_prompt, root, args.timeout)
+                if res.returncode != 0:
+                    review_text = (
+                        "Verdict: REVIEW_BLOCKED\n\n## BLOCKERS\n"
+                        f"- reviewer command failed with exit {res.returncode}; review evidence is invalid\n\n"
+                        "## reviewer stdout\n```text\n" + res.stdout + "\n```\n\n"
+                        "## reviewer stderr\n```text\n" + res.stderr + "\n```\n"
+                    )
+                else:
+                    review_text = res.stdout + ("\n\n## reviewer stderr\n```text\n" + res.stderr + "\n```\n" if res.stderr else "")
+                append_ledger(rd, "review_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode)
+            elif args.send:
+                tmux_send(args.reviewer_target, review_prompt)
+                append_ledger(rd, "review_send", "sent", iteration=iteration, target=args.reviewer_target)
+                if args.tmux_wait_seconds:
+                    subprocess.run(["sleep", str(args.tmux_wait_seconds)], check=False)
+                cap = subprocess.run(["tmux", "capture-pane", "-t", args.reviewer_target, "-p", "-S", f"-{args.capture_lines}"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                review_text = cap.stdout
+            else:
+                raise SystemExit("cfc loop requires an independent reviewer: pass --reviewer-command or use --send with --reviewer-target")
+            review_path = rd / extract_review_result_name(iteration)
+            review_path.write_text(review_text, encoding="utf-8")
+            final_parsed = parse_review_result(review_text)
+            (rd / "BLOCKERS.md").write_text(render_blockers_md(review_path, final_parsed), encoding="utf-8")
+            run["review"] = {"verdict": final_parsed["verdict"], "blockers": final_parsed["blockers"], "review_file": str(review_path), "classified_at": now_iso()}
+            write_json(rd / "RUN.json", run)
+            append_ledger(rd, "review_classify", final_parsed["verdict"].lower(), iteration=iteration, blocker_count=len(final_parsed["blockers"]))
+        blockers = final_parsed.get("blockers", [])
+        if not blockers and run.get("check", {}).get("verdict") != "FAIL":
+            append_ledger(rd, "loop", "pass", iteration=iteration)
+            break
+        if iteration >= args.max_iterations:
+            run["status"] = "review_blocked"
+            write_json(rd / "RUN.json", run)
+            append_ledger(rd, "loop", "review_blocked", iteration=iteration, blocker_count=len(blockers))
+            break
+        repair_prompt = render_repair_prompt(run, root, rd, iteration, blockers or run.get("check", {}).get("failures", []))
+        repair_path = rd / f"REPAIR_PROMPT.iteration-{iteration}.md"
+        repair_path.write_text(repair_prompt, encoding="utf-8")
+        append_ledger(rd, "repair_prompt", "done", iteration=iteration, path=str(repair_path), blocker_count=len(blockers))
+    run, rd = active_run(root)
+    cmd_learn(argparse.Namespace(root=str(root), apply=args.apply_learn))
+    run, rd = active_run(root)
+    if run.get("status") != "review_blocked" and run.get("check", {}).get("verdict") != "FAIL" and not final_parsed.get("blockers"):
+        cmd_done(argparse.Namespace(root=str(root), force=False))
+    else:
+        print("CfC loop ended review_blocked/failed. Inspect BLOCKERS.md and run artifacts.")
+
+
 def cmd_events(args: argparse.Namespace) -> None:
     root = root_path(args)
     _, rd = active_run(root)
@@ -907,6 +1223,41 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tmux-target")
     sp.set_defaults(func=cmd_review)
 
+    sp = sub.add_parser("classify-review")
+    add_root(sp)
+    sp.add_argument("--review-file")
+    sp.set_defaults(func=cmd_classify_review)
+
+    sp = sub.add_parser("repair")
+    add_root(sp)
+    sp.add_argument("--iteration", type=int, default=1)
+    sp.add_argument("--send", action="store_true")
+    sp.add_argument("--tmux-target")
+    sp.add_argument("--executor-command")
+    sp.add_argument("--timeout", type=int, default=600)
+    sp.set_defaults(func=cmd_repair)
+
+    sp = sub.add_parser("loop")
+    add_root(sp)
+    sp.add_argument("request")
+    sp.add_argument("--allow", action="append")
+    sp.add_argument("--forbid", action="append")
+    sp.add_argument("--verify", action="append")
+    sp.add_argument("--max-iterations", type=int, default=3)
+    sp.add_argument("--executor-target", default="gjc:0.0")
+    sp.add_argument("--reviewer-target", default="gjc:0.1")
+    sp.add_argument("--send", action="store_true")
+    sp.add_argument("--tmux-wait-seconds", type=int, default=0)
+    sp.add_argument("--capture-lines", type=int, default=5000)
+    sp.add_argument("--executor-command")
+    sp.add_argument("--reviewer-command")
+    sp.add_argument("--timeout", type=int, default=600)
+    sp.add_argument("--allow-dirty", action="store_true")
+    sp.add_argument("--replace", action="store_true")
+    sp.add_argument("--apply-learn", action="store_true")
+    sp.add_argument("--review-on-check-fail", action="store_true", default=True)
+    sp.set_defaults(func=cmd_loop)
+
     sp = sub.add_parser("park")
     add_root(sp)
     sp.add_argument("note")
@@ -942,3 +1293,5 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
