@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -218,7 +219,48 @@ class CfCTest(unittest.TestCase):
     def test_no_args_opens_chat_mode(self):
         res = subprocess.run([sys.executable, str(SCRIPT)], input="/exit\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("CfC chat mode", res.stdout)
+        self.assertIn("cfc forge", res.stdout)
+        self.assertIn("cfc>", res.stdout)
+
+    def test_active_run_chat_offers_replace_without_crashing(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Existing"])
+        res = subprocess.run(
+            [sys.executable, str(SCRIPT), "chat", "--root", str(root)],
+            input="New task\nc\n/exit\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Active run already exists", res.stdout)
+        self.assertIn("Cancelled. Nothing changed.", res.stdout)
+
+    def test_replace_slash_command_supersedes_active_run(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        (root / "executor.py").write_text("import sys\nsys.stdin.read()\nprint('executor done')\n")
+        (root / "reviewer.py").write_text("import sys\nsys.stdin.read()\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Existing"])
+        env = dict(os.environ)
+        env["CFC_TMUX_WAIT_SECONDS"] = "0"
+        res = subprocess.run(
+            [sys.executable, str(SCRIPT), "chat", "--root", str(root)],
+            input=f"/replace New task\n/exit\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        # /replace reaches the loop without surfacing the old active-run error.
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Started CfC run", res.stdout)
+        self.assertNotIn("Active CfC run already exists", res.stdout)
 
     def test_loop_requires_reviewer_adapter(self):
         td, root = self.make_repo()

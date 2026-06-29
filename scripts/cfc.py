@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 CFC_DIR = ".cfc"
 DEFAULT_FORBIDDEN_PATHS = [
     "AGENTS.md",
@@ -1199,6 +1199,117 @@ def cmd_events(args: argparse.Namespace) -> None:
         print(line)
 
 
+def term_width(default: int = 100) -> int:
+    try:
+        return min(120, max(72, os.get_terminal_size().columns))
+    except OSError:
+        return default
+
+
+def box(title: str, body: list[str], width: int | None = None) -> str:
+    width = width or term_width()
+    inner = width - 4
+    top_title = f" {title} " if title else ""
+    top = "╭" + top_title + "─" * max(0, inner - len(top_title)) + "╮"
+    rows = [top]
+    for line in body:
+        visible = line[:inner]
+        rows.append("│ " + visible.ljust(inner) + " │")
+    rows.append("╰" + "─" * inner + "╯")
+    return "\n".join(rows)
+
+
+def project_pulse(root: Path) -> list[str]:
+    branch = git_branch(root) if (root / ".git").exists() else None
+    status = parse_status_files(git_status_short(root)) if (root / ".git").exists() else []
+    active = None
+    if cfc_path(root).exists():
+        try:
+            active = current_active_run_or_none(root)
+        except Exception:
+            active = None
+    lines = [
+        f"Repo     {root}",
+        f"Branch   {branch or '(not git)'}",
+        f"Dirty    {len(status)} file(s)" if status else "Dirty    clean",
+    ]
+    if active:
+        run, _ = active
+        lines.append(f"Run      active · {run.get('id')} · {run.get('title')}")
+    else:
+        lines.append("Run      none")
+    return lines
+
+
+def render_home(root: Path) -> None:
+    width = term_width()
+    left = [
+        "Crazy for Codex",
+        "shape · run · review · learn",
+        "",
+        f"[ CfC {VERSION} ]",
+    ]
+    right = [
+        "Flow keys",
+        "/ commands · natural text = run loop",
+        "/status · /events · /done · /replace <task>",
+        "/help · /exit",
+        "",
+        "Project pulse",
+        *project_pulse(root),
+    ]
+    body = []
+    split = 32
+    max_len = max(len(left), len(right))
+    for i in range(max_len):
+        l = left[i] if i < len(left) else ""
+        r = right[i] if i < len(right) else ""
+        body.append(l.ljust(split) + " │ " + r)
+    print(box(" cfc forge ", body, width=width))
+
+
+def print_active_run_prompt(root: Path, run: dict[str, Any], rd: Path) -> str:
+    body = [
+        "Active run already exists.",
+        f"id     {run.get('id')}",
+        f"title  {run.get('title')}",
+        f"path   {rd}",
+        "",
+        "Choose:",
+        "  r = replace active run with this request",
+        "  s = show status",
+        "  d = mark existing run done --force",
+        "  c = cancel this request",
+    ]
+    print(box(" active run ", body))
+    return input("cfc active> ").strip().lower()
+
+
+def dispatch_chat_request(root: Path, text: str, replace: bool = False, allow_dirty: bool = False) -> None:
+    if cfc_path(root).exists():
+        existing = current_active_run_or_none(root)
+        if existing and not replace:
+            run, rd = existing
+            choice = print_active_run_prompt(root, run, rd)
+            if choice in {"s", "status"}:
+                cmd_status(argparse.Namespace(root=str(root)))
+                return
+            if choice in {"d", "done"}:
+                cmd_done(argparse.Namespace(root=str(root), force=True))
+                replace = True
+            elif choice in {"r", "replace"}:
+                replace = True
+            else:
+                print("Cancelled. Nothing changed.")
+                return
+    dirty_files = parse_status_files(git_status_short(root)) if (root / ".git").exists() else []
+    auto_allow_dirty = allow_dirty or looks_like_cfc_dev_workspace(root, dirty_files)
+    try:
+        cmd_loop(default_loop_namespace(text, root=str(root), replace=replace, allow_dirty=auto_allow_dirty))
+    except SystemExit as exc:
+        print(box(" blocked ", [str(exc), "", "Try /status, /done, /replace <task>, or run with --allow-dirty."]))
+
+
 def known_commands() -> set[str]:
     return {
         "init", "start", "status", "gjc", "capture", "check", "diff", "review",
@@ -1236,16 +1347,20 @@ Type a task request and CfC will run the recursive loop against the current repo
 
 Examples:
   README 정리해줘
-  src 안에서 로그인 버그 고쳐줘
+  프로젝트 분석해봐
+  /replace README 정리해줘
 
 Slash commands:
-  /help      show this help
-  /status    show active run status
-  /events    show recent active run events
-  /exit      quit
+  /help              show this help
+  /status            show active run status
+  /events            show recent active run events
+  /done              force-finish active run
+  /replace <task>    replace the active run and execute <task>
+  /clear             redraw home screen
+  /exit              quit
 
 Defaults:
-  root: current directory
+  root: nearest git root
   allow: *
   verify: git diff --check
   executor target: $CFC_EXECUTOR_TARGET or gjc:0.0
@@ -1254,8 +1369,8 @@ Defaults:
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
-    root = root_path(args)
-    print("CfC chat mode. Type /help for commands, /exit to quit.")
+    root = nearest_git_root(root_path(args))
+    render_home(root)
     while True:
         try:
             text = input("cfc> ").strip()
@@ -1269,6 +1384,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
         if text == "/help":
             print_chat_help()
             continue
+        if text == "/clear":
+            render_home(root)
+            continue
         if text == "/status":
             try:
                 cmd_status(argparse.Namespace(root=str(root)))
@@ -1281,9 +1399,20 @@ def cmd_chat(args: argparse.Namespace) -> None:
             except SystemExit as exc:
                 print(exc, file=sys.stderr)
             continue
-        dirty_files = parse_status_files(git_status_short(root)) if (root / ".git").exists() else []
-        auto_allow_dirty = getattr(args, "allow_dirty", False) or looks_like_cfc_dev_workspace(root, dirty_files)
-        cmd_loop(default_loop_namespace(text, root=str(root), replace=args.replace, allow_dirty=auto_allow_dirty))
+        if text == "/done":
+            try:
+                cmd_done(argparse.Namespace(root=str(root), force=True))
+            except SystemExit as exc:
+                print(exc, file=sys.stderr)
+            continue
+        if text.startswith("/replace "):
+            task = text[len("/replace "):].strip()
+            if not task:
+                print("Usage: /replace <task>")
+                continue
+            dispatch_chat_request(root, task, replace=True, allow_dirty=getattr(args, "allow_dirty", False))
+            continue
+        dispatch_chat_request(root, text, replace=args.replace, allow_dirty=getattr(args, "allow_dirty", False))
 
 
 def run_bare_request(argv: list[str]) -> int:
@@ -1427,6 +1556,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("chat")
     add_root(sp)
     sp.add_argument("--replace", action="store_true")
+    sp.add_argument("--allow-dirty", action="store_true")
     sp.set_defaults(func=cmd_chat)
 
     sp = sub.add_parser("events")
@@ -1454,6 +1584,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

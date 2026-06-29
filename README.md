@@ -37,6 +37,16 @@ You can also pass a request directly:
 cfc "README 정리해줘" --root /path/to/repo
 ```
 
+```text
+╭  cfc forge  ─────────────────────────────────────────╮
+│ Crazy for Codex              │ Flow keys              │
+│ shape · run · review · learn │ /status · /events ...  │
+│ [ CfC 0.6.0 ]                │ Project pulse ...      │
+╰───────────────────────────────────────────────────────╯
+```
+
+If a run is already active, chat mode shows an active-run card and lets you choose `replace`, `status`, `done`, or `cancel` instead of crashing with an argparse-style error.
+
 By default, conversational requests run the recursive loop with:
 
 - `allow: *`
