@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 CFC_DIR = ".cfc"
 DEFAULT_FORBIDDEN_PATHS = [
     "AGENTS.md",
@@ -43,6 +43,37 @@ DEFAULT_IGNORED_STATUS_PATTERNS = [
     "*.pyc",
     "**/*.pyc",
 ]
+
+
+def default_status_patterns() -> list[str]:
+    return DEFAULT_IGNORED_STATUS_PATTERNS + [
+        "*.egg-info/**",
+        ".pytest_cache/**",
+        ".mypy_cache/**",
+        ".ruff_cache/**",
+    ]
+
+
+def nearest_git_root(start: Path) -> Path:
+    p = start.resolve()
+    if p.is_file():
+        p = p.parent
+    while True:
+        if (p / ".git").exists():
+            return p
+        if p.parent == p:
+            return start.resolve()
+        p = p.parent
+
+
+def looks_like_cfc_dev_workspace(root: Path, dirty_files: list[str]) -> bool:
+    # The old plugin workspace can contain the CfC prototype as untracked files.
+    # For chat UX, treat that known dev workspace as baseline instead of blocking
+    # every natural-language request.
+    return root.resolve() == Path("/Users/byeonheejae/Documents/cfc").resolve() and any(
+        f.startswith("plugins/cfc-recursive-harness/") or f.startswith("plugins/cfc-session-forensics/") or f == ".cfc" or f.startswith(".cfc/")
+        for f in dirty_files
+    )
 
 
 def now_iso() -> str:
@@ -1175,7 +1206,7 @@ def known_commands() -> set[str]:
     }
 
 
-def default_loop_namespace(request: str, root: str = ".", replace: bool = False) -> argparse.Namespace:
+def default_loop_namespace(request: str, root: str = ".", replace: bool = False, allow_dirty: bool = False) -> argparse.Namespace:
     return argparse.Namespace(
         root=root,
         request=request,
@@ -1191,7 +1222,7 @@ def default_loop_namespace(request: str, root: str = ".", replace: bool = False)
         executor_command=None,
         reviewer_command=None,
         timeout=600,
-        allow_dirty=False,
+        allow_dirty=allow_dirty,
         replace=replace,
         apply_learn=False,
         review_on_check_fail=True,
@@ -1250,13 +1281,16 @@ def cmd_chat(args: argparse.Namespace) -> None:
             except SystemExit as exc:
                 print(exc, file=sys.stderr)
             continue
-        cmd_loop(default_loop_namespace(text, root=str(root), replace=args.replace))
+        dirty_files = parse_status_files(git_status_short(root)) if (root / ".git").exists() else []
+        auto_allow_dirty = getattr(args, "allow_dirty", False) or looks_like_cfc_dev_workspace(root, dirty_files)
+        cmd_loop(default_loop_namespace(text, root=str(root), replace=args.replace, allow_dirty=auto_allow_dirty))
 
 
 def run_bare_request(argv: list[str]) -> int:
     request_parts: list[str] = []
     root = "."
     replace = False
+    allow_dirty = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -1268,13 +1302,20 @@ def run_bare_request(argv: list[str]) -> int:
             replace = True
             i += 1
             continue
+        if arg == "--allow-dirty":
+            allow_dirty = True
+            i += 1
+            continue
         request_parts.append(arg)
         i += 1
+    root_path_value = str(nearest_git_root(Path(root)))
     request = " ".join(request_parts).strip()
     if not request:
-        cmd_chat(argparse.Namespace(root=root, replace=replace))
+        cmd_chat(argparse.Namespace(root=root_path_value, replace=replace, allow_dirty=allow_dirty))
     else:
-        cmd_loop(default_loop_namespace(request, root=root, replace=replace))
+        dirty_files = parse_status_files(git_status_short(Path(root_path_value))) if (Path(root_path_value) / ".git").exists() else []
+        auto_allow_dirty = allow_dirty or looks_like_cfc_dev_workspace(Path(root_path_value), dirty_files)
+        cmd_loop(default_loop_namespace(request, root=root_path_value, replace=replace, allow_dirty=auto_allow_dirty))
     return 0
 
 
@@ -1413,6 +1454,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 
