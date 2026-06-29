@@ -38,6 +38,8 @@ Make GJC work evidence-backed and self-improving by adding an external layer tha
 ## MVP Commands
 
 ```bash
+cfc
+cfc "task" --root /path/to/repo
 cfc init
 cfc start "task" --allow <path> --forbid <path> --verify "command"
 # refuses dirty worktrees by default; use --allow-dirty to accept baseline dirt

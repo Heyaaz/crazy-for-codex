@@ -215,6 +215,11 @@ class CfCTest(unittest.TestCase):
         self.assertTrue((rd / "DONE.md").exists())
         self.assertTrue((rd / "REVIEW.iteration-1.md").exists())
 
+    def test_no_args_opens_chat_mode(self):
+        res = subprocess.run([sys.executable, str(SCRIPT)], input="/exit\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("CfC chat mode", res.stdout)
+
     def test_loop_requires_reviewer_adapter(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)

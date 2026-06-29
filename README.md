@@ -14,6 +14,36 @@ It keeps GJC as the worker and adds an external control/learning layer:
 
 CfC does **not** mutate `.gjc/` state. `.gjc/` remains GJC runtime state; `.cfc/` is the external learning/control layer.
 
+## Conversational mode
+
+For daily use, run `cfc` with no subcommand:
+
+```bash
+cd /path/to/repo
+cfc
+```
+
+Then type naturally:
+
+```text
+cfc> README 정리해줘
+cfc> /status
+cfc> /exit
+```
+
+You can also pass a request directly:
+
+```bash
+cfc "README 정리해줘" --root /path/to/repo
+```
+
+By default, conversational requests run the recursive loop with:
+
+- `allow: *`
+- `verify: git diff --check`
+- executor target: `$CFC_EXECUTOR_TARGET` or `gjc:0.0`
+- reviewer target: `$CFC_REVIEWER_TARGET` or `cfc-review:0.0`
+
 ## Quick start
 
 ```bash

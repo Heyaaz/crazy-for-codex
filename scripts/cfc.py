@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 CFC_DIR = ".cfc"
 DEFAULT_FORBIDDEN_PATHS = [
     "AGENTS.md",
@@ -1168,6 +1168,116 @@ def cmd_events(args: argparse.Namespace) -> None:
         print(line)
 
 
+def known_commands() -> set[str]:
+    return {
+        "init", "start", "status", "gjc", "capture", "check", "diff", "review",
+        "classify-review", "repair", "loop", "park", "learn", "done", "events", "chat",
+    }
+
+
+def default_loop_namespace(request: str, root: str = ".", replace: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(
+        root=root,
+        request=request,
+        allow=["*"],
+        forbid=None,
+        verify=["git diff --check"],
+        max_iterations=3,
+        executor_target=os.environ.get("CFC_EXECUTOR_TARGET", "gjc:0.0"),
+        reviewer_target=os.environ.get("CFC_REVIEWER_TARGET", "cfc-review:0.0"),
+        send=True,
+        tmux_wait_seconds=int(os.environ.get("CFC_TMUX_WAIT_SECONDS", "120")),
+        capture_lines=5000,
+        executor_command=None,
+        reviewer_command=None,
+        timeout=600,
+        allow_dirty=False,
+        replace=replace,
+        apply_learn=False,
+        review_on_check_fail=True,
+    )
+
+
+def print_chat_help() -> None:
+    print("""CfC chat mode
+
+Type a task request and CfC will run the recursive loop against the current repo.
+
+Examples:
+  README 정리해줘
+  src 안에서 로그인 버그 고쳐줘
+
+Slash commands:
+  /help      show this help
+  /status    show active run status
+  /events    show recent active run events
+  /exit      quit
+
+Defaults:
+  root: current directory
+  allow: *
+  verify: git diff --check
+  executor target: $CFC_EXECUTOR_TARGET or gjc:0.0
+  reviewer target: $CFC_REVIEWER_TARGET or cfc-review:0.0
+""")
+
+
+def cmd_chat(args: argparse.Namespace) -> None:
+    root = root_path(args)
+    print("CfC chat mode. Type /help for commands, /exit to quit.")
+    while True:
+        try:
+            text = input("cfc> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not text:
+            continue
+        if text in {"/exit", "/quit", "exit", "quit"}:
+            break
+        if text == "/help":
+            print_chat_help()
+            continue
+        if text == "/status":
+            try:
+                cmd_status(argparse.Namespace(root=str(root)))
+            except SystemExit as exc:
+                print(exc, file=sys.stderr)
+            continue
+        if text == "/events":
+            try:
+                cmd_events(argparse.Namespace(root=str(root), limit=20))
+            except SystemExit as exc:
+                print(exc, file=sys.stderr)
+            continue
+        cmd_loop(default_loop_namespace(text, root=str(root), replace=args.replace))
+
+
+def run_bare_request(argv: list[str]) -> int:
+    request_parts: list[str] = []
+    root = "."
+    replace = False
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--root" and i + 1 < len(argv):
+            root = argv[i + 1]
+            i += 2
+            continue
+        if arg == "--replace":
+            replace = True
+            i += 1
+            continue
+        request_parts.append(arg)
+        i += 1
+    request = " ".join(request_parts).strip()
+    if not request:
+        cmd_chat(argparse.Namespace(root=root, replace=replace))
+    else:
+        cmd_loop(default_loop_namespace(request, root=root, replace=replace))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="cfc", description="CfC recursive GJC harness")
     p.add_argument("--version", action="version", version=f"CfC {VERSION}")
@@ -1273,6 +1383,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_done)
 
+    sp = sub.add_parser("chat")
+    add_root(sp)
+    sp.add_argument("--replace", action="store_true")
+    sp.set_defaults(func=cmd_chat)
+
     sp = sub.add_parser("events")
     add_root(sp)
     sp.add_argument("--limit", type=int, default=50)
@@ -1281,6 +1396,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        return run_bare_request([])
+    if argv[0] not in known_commands() and not argv[0].startswith("-"):
+        return run_bare_request(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -1293,5 +1413,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
