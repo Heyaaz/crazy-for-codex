@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 CFC_DIR = ".cfc"
 DEFAULT_FORBIDDEN_PATHS = [
     "AGENTS.md",
@@ -1199,27 +1199,43 @@ def cmd_events(args: argparse.Namespace) -> None:
         print(line)
 
 
-def term_width(default: int = 100) -> int:
+
+def term_width(default: int = 120) -> int:
     try:
-        return min(120, max(72, os.get_terminal_size().columns))
+        return min(160, max(80, os.get_terminal_size().columns))
     except OSError:
         return default
 
 
-def box(title: str, body: list[str], width: int | None = None) -> str:
+def ellipsize(text: str, width: int) -> str:
+    text = str(text).replace("\n", " ")
+    if width <= 1:
+        return text[:width]
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def rule(label: str = "", width: int | None = None, char: str = "─") -> str:
+    width = width or term_width()
+    if not label:
+        return char * width
+    mid = f" {label} "
+    left = max(1, (width - len(mid)) // 2)
+    right = max(1, width - len(mid) - left)
+    return char * left + mid + char * right
+
+
+def input_box(width: int | None = None) -> str:
     width = width or term_width()
     inner = width - 4
-    top_title = f" {title} " if title else ""
-    top = "╭" + top_title + "─" * max(0, inner - len(top_title)) + "╮"
-    rows = [top]
-    for line in body:
-        visible = line[:inner]
-        rows.append("│ " + visible.ljust(inner) + " │")
-    rows.append("╰" + "─" * inner + "╯")
-    return "\n".join(rows)
+    hint = "> Type your request... Enter: run loop · /help commands"
+    return "\n".join([
+        "╭" + "─" * inner + "╮",
+        "│ " + ellipsize(hint, inner).ljust(inner) + " │",
+        "╰" + "─" * inner + "╯",
+    ])
 
 
-def project_pulse(root: Path) -> list[str]:
+def project_pulse(root: Path) -> dict[str, str]:
     branch = git_branch(root) if (root / ".git").exists() else None
     status = parse_status_files(git_status_short(root)) if (root / ".git").exists() else []
     active = None
@@ -1228,61 +1244,47 @@ def project_pulse(root: Path) -> list[str]:
             active = current_active_run_or_none(root)
         except Exception:
             active = None
-    lines = [
-        f"Repo     {root}",
-        f"Branch   {branch or '(not git)'}",
-        f"Dirty    {len(status)} file(s)" if status else "Dirty    clean",
-    ]
-    if active:
-        run, _ = active
-        lines.append(f"Run      active · {run.get('id')} · {run.get('title')}")
-    else:
-        lines.append("Run      none")
-    return lines
+    return {
+        "repo": str(root),
+        "branch": branch or "not-git",
+        "dirty": f"{len(status)} changed" if status else "clean",
+        "run": (f"{active[0].get('title')} · {active[0].get('id')}" if active else "none"),
+    }
 
 
 def render_home(root: Path) -> None:
     width = term_width()
-    left = [
-        "Crazy for Codex",
-        "shape · run · review · learn",
-        "",
-        f"[ CfC {VERSION} ]",
-    ]
-    right = [
-        "Flow keys",
-        "/ commands · natural text = run loop",
-        "/status · /events · /done · /replace <task>",
-        "/help · /exit",
-        "",
-        "Project pulse",
-        *project_pulse(root),
-    ]
-    body = []
-    split = 32
-    max_len = max(len(left), len(right))
-    for i in range(max_len):
-        l = left[i] if i < len(left) else ""
-        r = right[i] if i < len(right) else ""
-        body.append(l.ljust(split) + " │ " + r)
-    print(box(" cfc forge ", body, width=width))
+    pulse = project_pulse(root)
+    print()
+    print(f"  CfC / Crazy for Codex".ljust(width - 18) + f"v{VERSION}")
+    print(rule("recursive agent harness", width))
+    print(f"  repo   {ellipsize(pulse['repo'], width - 9)}")
+    print(f"  state  branch {pulse['branch']} · dirty {pulse['dirty']} · run {ellipsize(pulse['run'], max(20, width - 45))}")
+    print()
+    print("  Flow")
+    print("  1. shape task   → 2. GJC execute   → 3. clean review   → 4. repair loop   → 5. learn")
+    print()
+    print("  Commands")
+    print("  /status  /events  /done  /replace <task>  /clear  /help  /exit")
+    print()
+    print(input_box(width))
+    print(f"⬢ CfC · controller / ⑂ {pulse['branch']} / 📁 {ellipsize(str(root), 42)}")
+    print()
 
 
 def print_active_run_prompt(root: Path, run: dict[str, Any], rd: Path) -> str:
-    body = [
-        "Active run already exists.",
-        f"id     {run.get('id')}",
-        f"title  {run.get('title')}",
-        f"path   {rd}",
-        "",
-        "Choose:",
-        "  r = replace active run with this request",
-        "  s = show status",
-        "  d = mark existing run done --force",
-        "  c = cancel this request",
-    ]
-    print(box(" active run ", body))
-    return input("cfc active> ").strip().lower()
+    width = term_width()
+    print()
+    print(rule("active run", width))
+    print(f"  Existing run: {run.get('title')}  ({run.get('id')})")
+    print(f"  Artifacts:    {rd}")
+    print()
+    print("  r  replace with the new request")
+    print("  s  show current status")
+    print("  d  force-done current run, then replace")
+    print("  c  cancel")
+    print(rule(width=width))
+    return input("cfc active › ").strip().lower()
 
 
 def dispatch_chat_request(root: Path, text: str, replace: bool = False, allow_dirty: bool = False) -> None:
@@ -1307,7 +1309,11 @@ def dispatch_chat_request(root: Path, text: str, replace: bool = False, allow_di
     try:
         cmd_loop(default_loop_namespace(text, root=str(root), replace=replace, allow_dirty=auto_allow_dirty))
     except SystemExit as exc:
-        print(box(" blocked ", [str(exc), "", "Try /status, /done, /replace <task>, or run with --allow-dirty."]))
+        print()
+        print(rule("blocked", term_width()))
+        print(str(exc))
+        print("\nTry: /status, /done, /replace <task>, or run with --allow-dirty.")
+        print(rule(width=term_width()))
 
 
 def known_commands() -> set[str]:
@@ -1373,7 +1379,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
     render_home(root)
     while True:
         try:
-            text = input("cfc> ").strip()
+            text = input("❯ ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -1584,6 +1590,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
 

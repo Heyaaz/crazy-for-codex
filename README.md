@@ -38,14 +38,22 @@ cfc "README 정리해줘" --root /path/to/repo
 ```
 
 ```text
-╭  cfc forge  ─────────────────────────────────────────╮
-│ Crazy for Codex              │ Flow keys              │
-│ shape · run · review · learn │ /status · /events ...  │
-│ [ CfC 0.6.0 ]                │ Project pulse ...      │
-╰───────────────────────────────────────────────────────╯
+  CfC / Crazy for Codex                                                        v0.7.0
+──────────────────────────── recursive agent harness ────────────────────────────
+  repo   /path/to/repo
+  state  branch main · dirty clean · run none
+
+  Flow
+  1. shape task   → 2. GJC execute   → 3. clean review   → 4. repair loop   → 5. learn
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ > Type your request... Enter: run loop · /help commands                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+⬢ CfC · controller / ⑂ main / 📁 /path/to/repo
+❯
 ```
 
-If a run is already active, chat mode shows an active-run card and lets you choose `replace`, `status`, `done`, or `cancel` instead of crashing with an argparse-style error.
+If a run is already active, chat mode shows a compact active-run panel and lets you choose `replace`, `status`, `done`, or `cancel` instead of crashing with an argparse-style error.
 
 By default, conversational requests run the recursive loop with:
 

@@ -219,8 +219,9 @@ class CfCTest(unittest.TestCase):
     def test_no_args_opens_chat_mode(self):
         res = subprocess.run([sys.executable, str(SCRIPT)], input="/exit\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("cfc forge", res.stdout)
-        self.assertIn("cfc>", res.stdout)
+        self.assertIn("CfC / Crazy for Codex", res.stdout)
+        self.assertIn("recursive agent harness", res.stdout)
+        self.assertIn("❯", res.stdout)
 
     def test_active_run_chat_offers_replace_without_crashing(self):
         td, root = self.make_repo()
@@ -235,7 +236,8 @@ class CfCTest(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("Active run already exists", res.stdout)
+        self.assertIn("active run", res.stdout)
+        self.assertIn("Existing run", res.stdout)
         self.assertIn("Cancelled. Nothing changed.", res.stdout)
 
     def test_replace_slash_command_supersedes_active_run(self):
