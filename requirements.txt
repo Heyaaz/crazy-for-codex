@@ -1,0 +1,2 @@
+# CfC is stdlib-only for the MVP.
+# This file exists so dependency scanners and humans know no install step is required.
