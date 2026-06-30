@@ -166,6 +166,60 @@ def cmd_diff(args: argparse.Namespace) -> None:
     append_ledger(rd, "diff", "done", path=str(path))
     print(f"Wrote diff: {path}")
 
+def is_cfc_python_path(path: str) -> bool:
+    return path == "scripts/cfc.py" or (path.startswith("scripts/cfc_lib/") and path.endswith(".py"))
+
+def cfc_python_files(root: Path, changed_self_files: list[str]) -> list[str]:
+    files = set(changed_self_files)
+    if (root / "scripts" / "cfc.py").exists() or "scripts/cfc.py" in files:
+        files.add("scripts/cfc.py")
+    lib_dir = root / "scripts" / "cfc_lib"
+    if lib_dir.exists():
+        files.update(str(p.relative_to(root)) for p in sorted(lib_dir.glob("*.py")))
+    return sorted(files)
+
+def file_sha256_or_missing(root: Path, path: str) -> str:
+    target = root / path
+    if not target.exists():
+        return "<missing>"
+    return hashlib.sha256(target.read_bytes()).hexdigest()
+
+def cfc_self_file_hashes(root: Path, changed_self_files: list[str]) -> dict[str, str]:
+    return {path: file_sha256_or_missing(root, path) for path in sorted(changed_self_files)}
+
+def run_cfc_self_py_compile(root: Path, changed_self_files: list[str]) -> dict[str, Any]:
+    files = cfc_python_files(root, changed_self_files)
+    res = subprocess.run(
+        [sys.executable, "-m", "py_compile", *files],
+        cwd=str(root),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return {
+        "command": "python -m py_compile scripts/cfc.py scripts/cfc_lib/*.py",
+        "exit_code": res.returncode,
+        "stdout": res.stdout[-8000:],
+        "stderr": res.stderr[-8000:],
+        "auto": True,
+        "guard": "cfc_self_py_compile",
+        "changed_files": sorted(changed_self_files),
+        "checked_files": files,
+        "file_hashes": cfc_self_file_hashes(root, changed_self_files),
+    }
+
+def current_cfc_self_changes(root: Path, baseline_changed: set[str]) -> list[str]:
+    return sorted(f for f in git_changed_files(root) if f not in baseline_changed and is_cfc_python_path(f))
+
+def has_fresh_successful_cfc_self_compile(root: Path, run: dict[str, Any], changed_self_files: list[str]) -> bool:
+    check = run.get("check", {}) or {}
+    guard = check.get("self_py_compile") or {}
+    if not changed_self_files:
+        return True
+    if guard.get("exit_code") != 0:
+        return False
+    return guard.get("file_hashes") == cfc_self_file_hashes(root, changed_self_files)
+
 def cmd_check(args: argparse.Namespace) -> None:
     root = root_path(args)
     run, rd = active_run(root)
@@ -189,6 +243,11 @@ def cmd_check(args: argparse.Namespace) -> None:
     forbidden = g.get("forbidden_paths", [])
     outside_allowed = [] if not allowed else [f for f in changed if not match_any(f, allowed)]
     forbidden_changed = [f for f in changed if match_any(f, forbidden)]
+    self_changed = sorted(f for f in changed if is_cfc_python_path(f))
+    self_py_compile: dict[str, Any] | None = None
+    if self_changed:
+        self_py_compile = run_cfc_self_py_compile(root, self_changed)
+        verification_results.append(self_py_compile)
     failures = []
     warnings = []
     if outside_allowed:
@@ -204,6 +263,8 @@ def cmd_check(args: argparse.Namespace) -> None:
     for r in verification_results:
         if r["exit_code"] != 0:
             failures.append(f"verification failed: {r['command']} exit {r['exit_code']}")
+    if self_changed and (not self_py_compile or self_py_compile["exit_code"] != 0):
+        failures.append("cfc self-modification requires successful py_compile before check/done success")
     if not verification_results and run.get("verification", {}).get("commands"):
         failures.append("verification commands configured but no result recorded")
     if not run.get("verification", {}).get("commands"):
@@ -212,6 +273,8 @@ def cmd_check(args: argparse.Namespace) -> None:
     report = render_check(run, changed, outside_allowed, forbidden_changed, verification_results, failures, warnings, verdict)
     (rd / "CHECK.md").write_text(report, encoding="utf-8")
     run["check"] = {"verdict": verdict, "changed_files": changed, "failures": failures, "warnings": warnings, "checked_at": now_iso()}
+    if self_py_compile:
+        run["check"]["self_py_compile"] = self_py_compile
     write_json(rd / "RUN.json", run)
     append_ledger(rd, "check", verdict.lower(), changed_files=changed, failures=failures, warnings=warnings)
     print(report)
@@ -275,6 +338,7 @@ def cmd_done(args: argparse.Namespace) -> None:
     verdict = run.get("check", {}).get("verdict")
     baseline_changed = set(run.get("precheck", {}).get("changed_files", []))
     changed = [f for f in git_changed_files(root) if f not in baseline_changed]
+    self_changed = current_cfc_self_changes(root, baseline_changed)
     review = run.get("review") or {}
     review_files = sorted(rd.glob("REVIEW.iteration-*.md"))
     if not args.force:
@@ -290,6 +354,8 @@ def cmd_done(args: argparse.Namespace) -> None:
             raise SystemExit("RUN.json has no classified review result. Run cfc classify-review before cfc done.")
         if str(review.get("verdict", "")).upper() == "REVIEW_BLOCKED":
             raise SystemExit("Independent review is REVIEW_BLOCKED. Repair blockers or use --force intentionally.")
+    if self_changed and not has_fresh_successful_cfc_self_compile(root, run, self_changed):
+        raise SystemExit("CfC self-modification requires a fresh successful py_compile in CHECK.md before cfc done.")
     if not getattr(args, "no_auto_learn", False):
         # High-severity learn candidates are never auto-applied under --force.
         # Force-finalizing a run does not silently mutate the wiki; the only way

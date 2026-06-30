@@ -14,20 +14,67 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .common import append_ledger, now_iso
+from .common import append_ledger, now_iso, sha256_text
 from .paths import root_path, wiki_dir
 from .review_result import parse_review_result
 from .state import active_run
 
-def run_learn(root: Path, run: dict[str, Any], rd: Path, apply: bool = False, auto_apply_high: bool = False) -> tuple[str, list[dict[str, str]], list[dict[str, str]]]:
-    check = (rd / "CHECK.md").read_text(encoding="utf-8", errors="ignore") if (rd / "CHECK.md").exists() else ""
+def injected_wiki_fragments(rd: Path) -> list[str]:
+    fragments: list[str] = []
+    seen: set[str] = set()
+    for prompt in sorted([*rd.glob("PROMPT*.md"), *rd.glob("REPAIR_PROMPT*.md")]):
+        text = prompt.read_text(encoding="utf-8", errors="ignore")
+        for block in re.findall(r"(?s)<!-- CFC:WIKI-SOURCE [^>]+ BEGIN -->(.*?)<!-- CFC:WIKI-SOURCE [^>]+ END -->", text):
+            for line in block.splitlines():
+                clean = line.strip().lstrip("-").strip()
+                if clean.startswith("#"):
+                    continue
+                if len(clean) < 24:
+                    continue
+                key = clean.lower()
+                if key not in seen:
+                    seen.add(key)
+                    fragments.append(clean)
+    return fragments
+
+def is_injected_fragment(text: str, fragments: list[str]) -> bool:
+    normalized = re.sub(r"\s+", " ", text.strip()).lower()
+    if len(normalized) < 24:
+        return False
+    for fragment in fragments:
+        f = re.sub(r"\s+", " ", fragment.strip()).lower()
+        if len(f) >= 24 and (normalized in f or f in normalized):
+            return True
+    return False
+
+def remove_injected_wiki_text(text: str, fragments: list[str]) -> str:
+    cleaned = text
+    for fragment in sorted(fragments, key=len, reverse=True):
+        cleaned = re.sub(re.escape(fragment), "", cleaned, flags=re.IGNORECASE)
+    return cleaned
+
+def read_source_artifacts(rd: Path) -> tuple[str, str, list[dict[str, str]]]:
+    check = ""
+    sources: list[dict[str, str]] = []
+    check_path = rd / "CHECK.md"
+    if check_path.exists():
+        check = check_path.read_text(encoding="utf-8", errors="ignore")
+        sources.append({"kind": "check", "path": check_path.name, "sha256": sha256_text(check)})
     review_files = sorted(rd.glob("REVIEW.iteration-*.md"))
-    review_text = "\n\n".join(p.read_text(encoding="utf-8", errors="ignore")[:8000] for p in review_files)
-    candidates = derive_learn_candidates(run, check, review_text)
+    review_chunks: list[str] = []
+    for p in review_files:
+        text = p.read_text(encoding="utf-8", errors="ignore")
+        sources.append({"kind": "review", "path": p.name, "sha256": sha256_text(text)})
+        review_chunks.append(text[:8000])
+    return check, "\n\n".join(review_chunks), sources
+
+def run_learn(root: Path, run: dict[str, Any], rd: Path, apply: bool = False, auto_apply_high: bool = False) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    check, review_text, source_artifacts = read_source_artifacts(rd)
+    candidates = derive_learn_candidates(run, check, review_text, injected_wiki_fragments(rd), source_artifacts)
     learn_md = render_learn(run, candidates)
     (rd / "LEARN.md").write_text(learn_md, encoding="utf-8")
     append_ledger(rd, "learn", "suggested", candidate_count=len(candidates), path=str(rd / "LEARN.md"))
-    applied: list[dict[str, str]] = []
+    applied: list[dict[str, Any]] = []
     if apply:
         applied = candidates
     elif auto_apply_high:
@@ -45,12 +92,20 @@ def cmd_learn(args: argparse.Namespace) -> None:
         print(f"Applied {len(applied)} learn candidate(s) to .cfc/wiki")
     print(learn_md)
 
-def derive_learn_candidates(run: dict[str, Any], check: str, review: str) -> list[dict[str, str]]:
-    text = (check + "\n" + review).lower()
+def derive_learn_candidates(
+    run: dict[str, Any],
+    check: str,
+    review: str,
+    injected_fragments: list[str] | None = None,
+    source_artifacts: list[dict[str, str]] | None = None,
+) -> list[dict[str, Any]]:
+    injected_fragments = injected_fragments or []
+    clean_review = remove_injected_wiki_text(review, injected_fragments)
+    text = (check + "\n" + clean_review).lower()
     check_verdict = str(run.get("check", {}).get("verdict", "")).upper()
     has_failures_section = "## failures" in text
     has_warnings_section = "## warnings" in text
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     if check_verdict == "FAIL" and "verification failed" in text:
         out.append({
             "type": "Failure",
@@ -81,7 +136,16 @@ def derive_learn_candidates(run: dict[str, Any], check: str, review: str) -> lis
             "prevention": "Stop before editing any file outside allowed paths; ask for scope expansion instead.",
             "prompt_patch": "Do not edit outside allowed paths. If the task requires it, stop and explain the required scope expansion first.",
         })
-    parsed_review = parse_review_result(review) if review.strip() else {"verdict": "PASS", "blockers": []}
+    if review.strip() and injected_fragments:
+        original_parsed = parse_review_result(review)
+        remaining = [b for b in original_parsed.get("blockers", []) if not is_injected_fragment(b, injected_fragments)]
+        if original_parsed.get("verdict") == "REVIEW_BLOCKED" and original_parsed.get("blockers") and not remaining:
+            parsed_review = {"verdict": "PASS", "blockers": [], "major": [], "minor": []}
+        else:
+            parsed_review = parse_review_result(clean_review)
+            parsed_review["blockers"] = [b for b in parsed_review.get("blockers", []) if not is_injected_fragment(b, injected_fragments)]
+    else:
+        parsed_review = parse_review_result(clean_review) if clean_review.strip() else {"verdict": "PASS", "blockers": []}
     review_blocker_text = "\n".join(parsed_review.get("blockers", []))
     if parsed_review.get("verdict") == "REVIEW_BLOCKED" and (
         "did not produce a final verdict" in review_blocker_text.lower()
@@ -114,9 +178,13 @@ def derive_learn_candidates(run: dict[str, Any], check: str, review: str) -> lis
         if c["slug"] not in seen:
             seen.add(c["slug"])
             uniq.append(c)
+    evidence_hash = sha256_text(check + "\n" + review)
+    for candidate in uniq:
+        candidate["source_artifacts"] = list(source_artifacts or [])
+        candidate["evidence_sha256"] = evidence_hash
     return uniq[:3]
 
-def render_learn(run: dict[str, Any], candidates: list[dict[str, str]]) -> str:
+def render_learn(run: dict[str, Any], candidates: list[dict[str, Any]]) -> str:
     parts = [f"# Learn Candidates: {run['title']}"]
     if not candidates:
         parts.append("No strong learn candidates found. Keep this run as evidence only.")
@@ -139,9 +207,31 @@ Suggested slug: `{c['slug']}`
 
 > {c['prompt_patch']}
 """)
+        if c.get("source_artifacts"):
+            parts.append("### Source Artifacts\n\n" + "\n".join(
+                f"- `{a.get('path')}` ({a.get('kind')}): `{a.get('sha256')}`"
+                for a in c.get("source_artifacts", [])
+            ))
+        if c.get("evidence_sha256"):
+            parts.append(f"Evidence SHA256: `{c['evidence_sha256']}`")
     return "\n\n".join(parts) + "\n"
 
-def apply_candidates(root: Path, run: dict[str, Any], candidates: list[dict[str, str]]) -> None:
+def render_source_artifacts_yaml(artifacts: list[dict[str, str]]) -> str:
+    if not artifacts:
+        return "source_artifacts: []"
+    lines = ["source_artifacts:"]
+    for artifact in artifacts:
+        lines.append(f"  - kind: {artifact.get('kind', '')}")
+        lines.append(f"    path: {artifact.get('path', '')}")
+        lines.append(f"    sha256: {artifact.get('sha256', '')}")
+    return "\n".join(lines)
+
+def render_source_artifacts_md(artifacts: list[dict[str, str]]) -> str:
+    if not artifacts:
+        return "- none"
+    return "\n".join(f"- `{a.get('path')}` ({a.get('kind')}): `{a.get('sha256')}`" for a in artifacts)
+
+def apply_candidates(root: Path, run: dict[str, Any], candidates: list[dict[str, Any]]) -> None:
     type_to_dir = {"Failure": "failures", "Guardrail": "guardrails", "Runbook": "runbooks"}
     for c in candidates:
         d = wiki_dir(root) / type_to_dir.get(c["type"], "patterns")
@@ -149,15 +239,19 @@ def apply_candidates(root: Path, run: dict[str, Any], candidates: list[dict[str,
         path = d / f"{c['slug']}.md"
         if path.exists():
             continue
+        tags = sorted({"cfc", "gjc", *re.findall(r"[a-z0-9][a-z0-9_-]*", (c["title"] + " " + run["title"]).lower())})
+        source_artifacts = c.get("source_artifacts") or []
         path.write_text(f"""---
 type: {c['type']}
 title: {c['title']}
-tags: [cfc, gjc]
+tags: [{", ".join(tags[:12])}]
 status: active
 severity: {c['severity']}
 created_at: {now_iso()}
 source_runs:
   - ../runs/{run['id']}
+evidence_sha256: {c.get('evidence_sha256', '')}
+{render_source_artifacts_yaml(source_artifacts)}
 ---
 
 # Summary
@@ -175,6 +269,11 @@ source_runs:
 # Evidence
 
 Generated from CfC run `{run['id']}`. Review the run artifacts before treating this as a strong rule.
+
+Source artifacts:
+{render_source_artifacts_md(source_artifacts)}
+
+Evidence SHA256: `{c.get('evidence_sha256', '')}`
 """, encoding="utf-8")
     log = wiki_dir(root) / "log.md"
     with log.open("a", encoding="utf-8") as f:

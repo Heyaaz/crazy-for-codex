@@ -17,6 +17,46 @@ from typing import Any
 from .common import read_json
 from .paths import current_file, ensure_cfc, runs_dir, wiki_dir
 
+def task_tokens(text: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]*", text.lower()):
+        parts = [raw, *raw.replace("_", "-").split("-")]
+        tokens.update(p for p in parts if len(p) >= 3)
+    return tokens
+
+def parse_wiki_tags(text: str) -> set[str]:
+    tags: set[str] = set()
+    for m in re.finditer(r"(?im)^\s*tags\s*:\s*\[(.*?)\]\s*$", text):
+        for tag in m.group(1).split(","):
+            clean = tag.strip().strip("'\"").lower()
+            if clean:
+                tags.add(clean)
+    in_tags = False
+    for line in text.splitlines():
+        if re.match(r"(?i)^\s*tags\s*:\s*$", line):
+            in_tags = True
+            continue
+        if in_tags:
+            item = re.match(r"^\s*-\s*(.+?)\s*$", line)
+            if item:
+                tags.add(item.group(1).strip().strip("'\"").lower())
+                continue
+            if line.strip() and not line.startswith((" ", "\t")):
+                break
+    return tags
+
+def wiki_relevance_score(path: Path, text: str, title: str, task: set[str]) -> int:
+    tags = parse_wiki_tags(text)
+    if not task:
+        return 0
+    score = 0
+    score += 5 * len(tags & task)
+    score += 2 * len(task_tokens(title) & task)
+    score += len(task_tokens(path.stem) & task)
+    if "severity: high" in text.lower():
+        score += 1
+    return score
+
 def active_run(root: Path) -> tuple[dict[str, Any], Path]:
     ensure_cfc(root)
     cur = read_json(current_file(root), default=None)
@@ -40,15 +80,27 @@ def current_active_run_or_none(root: Path) -> tuple[dict[str, Any], Path] | None
         return run, rd
     return None
 
-def collect_active_wiki(root: Path, max_guardrails: int = 5, max_failures: int = 3, max_runbooks: int = 2) -> dict[str, list[tuple[str, str]]]:
-    out: dict[str, list[tuple[str, str]]] = {"guardrails": [], "failures": [], "runbooks": []}
+def collect_active_wiki(root: Path, task_text: str = "", max_guardrails: int = 5, max_failures: int = 3, max_runbooks: int = 2) -> dict[str, list[tuple[str, str, dict[str, Any]]]]:
+    """Collect active wiki items with provenance.
+
+    Each item is ``(title, body, provenance)`` where ``provenance`` records
+    section, source path (relative to the wiki dir), parsed tags, relevance
+    score, a short human reason, and a stable ``source_id`` (sha256 prefix)
+    that uniquely identifies the injected wiki block for lineage tracking.
+    Callers that only render the wiki text should still unpack the third
+    element and may ignore it; the prompt renderer uses it to record injection
+    provenance as a run artifact (WIKI_CONTEXT.md / RUN.json ``wiki_context``).
+    """
+    out: dict[str, list[tuple[str, str, dict[str, Any]]]] = {"guardrails": [], "failures": [], "runbooks": []}
     base = wiki_dir(root)
+    task = task_tokens(task_text)
     specs = [("guardrails", max_guardrails), ("failures", max_failures), ("runbooks", max_runbooks)]
     for section, limit in specs:
         d = base / section
         if not d.exists():
             continue
-        for p in sorted(d.glob("*.md"))[:limit]:
+        entries: list[tuple[int, str, str, str, dict[str, Any]]] = []
+        for p in sorted(d.glob("*.md")):
             text = p.read_text(encoding="utf-8", errors="ignore")
             if "status: retired" in text or "status: stale" in text:
                 continue
@@ -64,5 +116,35 @@ def collect_active_wiki(root: Path, max_guardrails: int = 5, max_failures: int =
                     snippet = text[idx: idx + 900]
                     body.append(snippet.strip())
                     break
-            out[section].append((title, "\n".join(body)[:900]))
+            snippet = "\n".join(body)[:900]
+            tags = sorted(parse_wiki_tags(text))
+            score = wiki_relevance_score(p, text, title, task)
+            reason_bits = []
+            overlap_tags = sorted(set(tags) & task)
+            if overlap_tags:
+                reason_bits.append("tags: " + ", ".join(overlap_tags))
+            if task_tokens(title) & task:
+                reason_bits.append("title match")
+            if task_tokens(p.stem) & task:
+                reason_bits.append("filename match")
+            if not reason_bits:
+                reason_bits.append("fallback: no token overlap, kept as general memory")
+            source_id = hashlib.sha256(f"{section}\n{title}\n{snippet}".encode("utf-8")).hexdigest()[:16]
+            try:
+                rel_path = str(p.relative_to(base))
+            except ValueError:
+                rel_path = p.name
+            provenance = {
+                "section": section,
+                "path": rel_path,
+                "tags": tags,
+                "score": score,
+                "reason": "; ".join(reason_bits),
+                "source_id": source_id,
+            }
+            entries.append((score, p.name, title, snippet, provenance))
+        if any(score > 0 for score, _, _, _, _ in entries):
+            entries = [entry for entry in entries if entry[0] > 0]
+        entries.sort(key=lambda entry: (-entry[0], entry[1]))
+        out[section].extend((title, snippet, prov) for _, _, title, snippet, prov in entries[:limit])
     return out
