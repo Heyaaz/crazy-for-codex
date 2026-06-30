@@ -382,6 +382,17 @@ class CfCTest(unittest.TestCase):
         self.assertIn("cfc plugin run", res.stdout)
         self.assertNotIn("❯", res.stdout)
 
+    def test_scripts_do_not_embed_private_absolute_paths(self):
+        script_root = SCRIPT.parent
+        files = [SCRIPT, *sorted((script_root / "cfc_lib").glob("*.py"))]
+        private_prefix = "/" + "Users" + "/"
+        offenders = []
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            if private_prefix in text:
+                offenders.append(str(path.relative_to(SCRIPT.parents[1])))
+        self.assertEqual(offenders, [])
+
     def test_plugin_manifest_is_machine_readable(self):
         res = run(["plugin", "manifest"])
         self.assertEqual(res.returncode, 0, res.stderr)
