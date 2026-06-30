@@ -60,8 +60,8 @@ plus optional local `.cfc/config.local.json` overrides. This repository ships a
 cost-optimized command-mode default:
 
 - executor profile `auto`
-  - localized/simple tasks -> `cheap` -> `gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}`
-  - broad/async/state/security/migration tasks -> `complex` -> `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}`
+  - all executor tasks -> `glm` -> `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}`
+  - GLM command failure (quota/rate/auth/timeout/nonzero exit) -> `codex-executor` fallback
 - reviewer profile `codex` -> `codex exec --sandbox read-only -`
 
 The reviewer remains the only final PASS/REVIEW_BLOCKED authority; OpenCode Go models
@@ -76,10 +76,15 @@ of oversized shell argv/stdin assumptions.
     "executor_profile": "auto",
     "reviewer_profile": "codex",
     "profiles": {
-      "cheap": { "command": "gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}" },
-      "complex": { "command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}" },
+      "glm": { "command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}" },
+      "codex-executor": { "command": "codex exec --dangerously-bypass-approvals-and-sandbox -" },
       "codex": { "command": "codex exec --sandbox read-only -" }
-    }
+    },
+    "auto": {
+      "default_executor_profile": "glm",
+      "complex_executor_profile": "glm"
+    },
+    "fallbacks": { "glm": ["codex-executor"] }
   }
 }
 ```
@@ -114,7 +119,7 @@ python3 scripts/cfc.py loop --root /path/to/repo \
   "Fix small UI issue" \
   --allow 'src/Foo.tsx' \
   --verify 'npm run lint' \
-  --executor-profile cheap \
+  --executor-profile glm \
   --reviewer-profile codex
 ```
 
@@ -233,6 +238,7 @@ events          print ledger.jsonl events
     GJC_LOG.<time>.md
     GJC_LOG.iteration-1.md
     EXECUTION.iteration-1.md        # command-mode executor output
+    EXECUTION.iteration-1.fallback-1.md # optional executor fallback output
     DIFF.md
     CHECK.md
     REVIEW_PROMPT.iteration-1.md

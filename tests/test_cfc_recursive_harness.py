@@ -160,6 +160,19 @@ class CfCTest(unittest.TestCase):
         self.assertNotIn("Applied 1 high-confidence learn candidate", res.stdout)
         self.assertFalse((root / ".cfc" / "wiki" / "guardrails" / "no-surprise-files-outside-task-scope.md").exists())
 
+    def test_force_done_apply_learn_explicitly_applies_candidates(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Bad edit", "--allow", "src/app.py", "--forbid", "AGENTS.md"])
+        (root / "AGENTS.md").write_text("oops\n")
+        res = run(["check", "--root", str(root)])
+        self.assertIn("**FAIL**", res.stdout)
+        res = run(["done", "--root", str(root), "--force", "--apply-learn"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Applied 2 learn candidate", res.stdout)
+        self.assertTrue((root / ".cfc" / "wiki" / "guardrails" / "no-surprise-files-outside-task-scope.md").exists())
+
     def test_prompt_includes_active_wiki(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)
@@ -375,6 +388,43 @@ class CfCTest(unittest.TestCase):
         self.assertTrue((rd / "DONE.md").exists())
         self.assertTrue((rd / "REVIEW.iteration-1.md").exists())
 
+    def test_loop_apply_learn_writes_wiki_log_once_on_happy_path(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        executor = Path(root) / "executor.py"
+        reviewer = Path(root) / "reviewer.py"
+        executor.write_text("import sys\nsys.stdin.read()\nprint('executor done')\n")
+        reviewer.write_text("import sys\nsys.stdin.read()\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run([
+            "loop", "--root", str(root), "Command loop learn once",
+            "--executor-command", f"{sys.executable} executor.py",
+            "--reviewer-command", f"{sys.executable} reviewer.py",
+            "--apply-learn",
+        ])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        log = (root / ".cfc" / "wiki" / "log.md").read_text()
+        self.assertEqual(log.count("Applied 1 learn candidates"), 1)
+
+    def test_loop_reviewer_command_noncanonical_verdict_is_blocked(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        (root / "executor.py").write_text("import sys\nsys.stdin.read()\nprint('ok')\n")
+        (root / "reviewer.py").write_text("import sys\nsys.stdin.read()\nprint('Verdict: BLOCKED')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run([
+            "loop", "--root", str(root), "Noncanonical reviewer verdict",
+            "--executor-command", f"{sys.executable} executor.py",
+            "--reviewer-command", f"{sys.executable} reviewer.py",
+            "--max-iterations", "1",
+        ])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        rd = next((root / ".cfc" / "runs").iterdir())
+        self.assertFalse((rd / "DONE.md").exists())
+        self.assertIn("unsupported Verdict: BLOCKED", (rd / "BLOCKERS.md").read_text())
+
     def test_no_args_prints_headless_plugin_help(self):
         res = subprocess.run([sys.executable, str(SCRIPT)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -396,13 +446,16 @@ class CfCTest(unittest.TestCase):
     def test_repo_default_config_uses_gjc_opencode_go_profiles(self):
         config = json.loads((SCRIPT.parents[1] / "cfc.config.json").read_text(encoding="utf-8"))
         profiles = config["adapters"]["profiles"]
-        self.assertEqual(profiles["cheap"]["provider"], "opencode-go")
-        self.assertEqual(profiles["cheap"]["model"], "opencode-go/kimi-k2.7-code")
-        self.assertIn("gjc -p --model opencode-go/kimi-k2.7-code", profiles["cheap"]["command"])
-        self.assertIn("@{prompt_file}", profiles["cheap"]["command"])
-        self.assertEqual(profiles["complex"]["provider"], "opencode-go")
-        self.assertEqual(profiles["complex"]["model"], "opencode-go/glm-5.2")
-        self.assertIn("gjc -p --model opencode-go/glm-5.2", profiles["complex"]["command"])
+        self.assertEqual(config["adapters"]["auto"]["default_executor_profile"], "glm")
+        self.assertEqual(config["adapters"]["auto"]["complex_executor_profile"], "glm")
+        self.assertEqual(config["adapters"]["fallbacks"]["glm"], ["codex-executor"])
+        self.assertEqual(profiles["glm"]["provider"], "opencode-go")
+        self.assertEqual(profiles["glm"]["model"], "opencode-go/glm-5.2")
+        self.assertIn("gjc -p --model opencode-go/glm-5.2", profiles["glm"]["command"])
+        self.assertIn("@{prompt_file}", profiles["glm"]["command"])
+        self.assertEqual(profiles["codex-executor"]["provider"], "codex")
+        self.assertIn("codex exec --dangerously-bypass-approvals-and-sandbox -", profiles["codex-executor"]["command"])
+        self.assertNotIn("k2.7-code", json.dumps(config))
         self.assertNotIn("opencode run", json.dumps(config))
 
     def test_agent_command_prompt_file_placeholder_writes_and_cleans_temp_file(self):
@@ -536,13 +589,13 @@ class CfCTest(unittest.TestCase):
         rd = root / ".cfc" / "runs" / cur["last_run_id"]
         self.assertTrue((rd / "DONE.md").exists())
 
-    def test_auto_executor_profile_escalates_complex_tasks_to_glm_profile(self):
+    def test_auto_executor_profile_keeps_complex_tasks_on_glm_profile(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)
-        cheap_marker = root / ".cfc" / "cheap_called.txt"
-        complex_marker = root / ".cfc" / "complex_called.txt"
-        (root / "cheap.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(cheap_marker)!r}).write_text('cheap\\n')\n")
-        (root / "complex.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(complex_marker)!r}).write_text('complex\\n')\n")
+        glm_marker = root / ".cfc" / "glm_called.txt"
+        codex_marker = root / ".cfc" / "codex_executor_called.txt"
+        (root / "glm.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(glm_marker)!r}).write_text('glm\\n')\n")
+        (root / "codex_executor.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(codex_marker)!r}).write_text('codex\\n')\n")
         (root / "reviewer.py").write_text("import sys\nsys.stdin.read()\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
         (root / "cfc.config.json").write_text(json.dumps({
             "adapters": {
@@ -550,24 +603,63 @@ class CfCTest(unittest.TestCase):
                 "executor_profile": "auto",
                 "reviewer_profile": "codex",
                 "profiles": {
-                    "cheap": {"command": f"{sys.executable} cheap.py"},
-                    "complex": {"command": f"{sys.executable} complex.py"},
+                    "glm": {"command": f"{sys.executable} glm.py"},
+                    "codex-executor": {"command": f"{sys.executable} codex_executor.py"},
                     "codex": {"command": f"{sys.executable} reviewer.py"},
                 },
                 "auto": {
-                    "default_executor_profile": "cheap",
-                    "complex_executor_profile": "complex",
+                    "default_executor_profile": "glm",
+                    "complex_executor_profile": "glm",
                     "complex_keywords": ["async", "state"],
                 },
+                "fallbacks": {"glm": ["codex-executor"]},
             },
             "verification": {"commands": ["git diff --check"]},
         }))
-        subprocess.run(["git", "add", "cheap.py", "complex.py", "reviewer.py", "cfc.config.json"], cwd=root, check=True)
+        subprocess.run(["git", "add", "glm.py", "codex_executor.py", "reviewer.py", "cfc.config.json"], cwd=root, check=True)
         subprocess.run(["git", "commit", "-m", "auto profiles"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         res = run(["plugin", "run", "--root", str(root), "Fix async state machine"])
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertTrue(complex_marker.exists())
-        self.assertFalse(cheap_marker.exists())
+        self.assertTrue(glm_marker.exists())
+        self.assertFalse(codex_marker.exists())
+
+    def test_glm_executor_failure_falls_back_to_codex_executor(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        fallback_marker = root / ".cfc" / "codex_fallback_called.txt"
+        (root / "glm.py").write_text("import sys\nsys.stdin.read()\nprint('glm quota exhausted', file=sys.stderr)\nsys.exit(42)\n")
+        (root / "codex_executor.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(fallback_marker)!r}).write_text('codex fallback\\n')\nprint('codex fallback done')\n")
+        (root / "reviewer.py").write_text("import sys\nsys.stdin.read()\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        (root / "cfc.config.json").write_text(json.dumps({
+            "adapters": {
+                "mode": "command",
+                "executor_profile": "glm",
+                "reviewer_profile": "codex",
+                "profiles": {
+                    "glm": {"command": f"{sys.executable} glm.py"},
+                    "codex-executor": {"command": f"{sys.executable} codex_executor.py"},
+                    "codex": {"command": f"{sys.executable} reviewer.py"},
+                },
+                "fallbacks": {"glm": ["codex-executor"]},
+            },
+            "verification": {"commands": ["git diff --check"]},
+        }))
+        subprocess.run(["git", "add", "glm.py", "codex_executor.py", "reviewer.py", "cfc.config.json"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "fallback profiles"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run(["plugin", "run", "--root", str(root), "Small implementation"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(fallback_marker.exists())
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["last_run_id"]
+        primary = (rd / "EXECUTION.iteration-1.md").read_text()
+        fallback = (rd / "EXECUTION.iteration-1.fallback-1.md").read_text()
+        self.assertIn("Profile: `glm`", primary)
+        self.assertIn("Exit: `42`", primary)
+        self.assertIn("Profile: `codex-executor`", fallback)
+        self.assertIn("Fallback: `yes`", fallback)
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_data["runner"]["executor_fallback_used"]["profile"], "codex-executor")
+        self.assertTrue((rd / "DONE.md").exists())
 
     def test_cli_executor_profile_overrides_config_auto(self):
         td, root = self.make_repo()
@@ -866,6 +958,17 @@ class CfCTest(unittest.TestCase):
         self.assertNotIn("awaiting", run_data)
         self.assertEqual(run_data["send_error"]["phase"], "execute_send")
 
+    def test_short_run_token_uses_16_hex_digest(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_token", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        token = module.short_run_token("20260630-123456-same-second-run")
+        digest = token.rsplit("-", 1)[-1]
+        self.assertEqual(len(digest), 16)
+        self.assertRegex(digest, r"^[0-9a-f]{16}$")
+
     def test_isolated_tmux_creates_run_specific_targets_before_dispatch(self):
         spec = importlib.util.spec_from_file_location("cfc_module_isolated", SCRIPT)
         if spec is None or spec.loader is None:
@@ -972,11 +1075,125 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0][0], "review:0.0")
         self.assertIn("CfC Independent Review Prompt", sends[0][1])
+        self.assertTrue((rd / "EXECUTION.iteration-2.md").exists())
+        self.assertFalse(any(rd.glob("GJC_LOG.*.md")))
         self.assertTrue((rd / "CHECK.md").exists())
         self.assertTrue((rd / "REVIEW_PROMPT.iteration-2.md").exists())
         run_after = json.loads((rd / "RUN.json").read_text())
         self.assertEqual(run_after["awaiting"]["phase"], "reviewer")
         self.assertEqual(run_after["awaiting"]["iteration"], 2)
+
+    def test_async_executor_capture_without_reviewer_target_preserves_manual_awaiting(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_async_manual_review", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Async manual review", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False))
+        run_data, rd = module.active_run(root)
+        run_data.setdefault("runner", {})["target"] = "exec:0.0"
+        run_data["runner"].pop("reviewer_target", None)
+        run_data["awaiting"] = {"phase": "executor", "iteration": 1, "target": "exec:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=0, iteration=None)
+        with mock.patch.dict(module.os.environ, {"CFC_REVIEWER_TARGET": ""}), mock.patch.object(module, "tmux_capture", return_value=subprocess.CompletedProcess(["tmux"], 0, "executor done\n", "")):
+            module.cmd_capture(ns)
+        run_after = json.loads((rd / "RUN.json").read_text())
+        awaiting = run_after["awaiting"]
+        self.assertEqual(awaiting["phase"], "reviewer")
+        self.assertIsNone(awaiting["target"])
+        self.assertTrue(awaiting["manual"])
+        self.assertTrue((rd / "REVIEW_PROMPT.iteration-1.md").exists())
+
+    def test_async_no_review_on_check_fail_skips_reviewer(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_async_no_review", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Async check fail", allow=["src/app.py"], forbid=["AGENTS.md"], verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False, max_iterations=2))
+        run_data, rd = module.active_run(root)
+        run_data.setdefault("runner", {})["target"] = "exec:0.0"
+        run_data["runner"]["reviewer_target"] = "review:0.0"
+        run_data["loop"]["review_on_check_fail"] = False
+        run_data["awaiting"] = {"phase": "executor", "iteration": 1, "target": "exec:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        (root / "AGENTS.md").write_text("oops\n")
+        sends = []
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=0, iteration=None)
+        with mock.patch.object(module, "tmux_capture", return_value=subprocess.CompletedProcess(["tmux"], 0, "executor done\n", "")), mock.patch.object(module, "tmux_send", side_effect=lambda target, prompt: sends.append((target, prompt))):
+            module.cmd_capture(ns)
+        self.assertEqual(sends, [])
+        self.assertFalse(any(rd.glob("REVIEW_PROMPT.iteration-*.md")))
+        self.assertTrue((rd / "BLOCKERS.md").exists())
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_after["status"], "review_blocked")
+        self.assertNotIn("awaiting", run_after)
+
+    def test_capture_does_not_overwrite_existing_review_iteration_file(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_review_no_clobber", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="No review clobber", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False))
+        run_data, rd = module.active_run(root)
+        run_data["awaiting"] = {"phase": "reviewer", "iteration": 1, "target": "review:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        existing = rd / "REVIEW.iteration-1.md"
+        existing.write_text("old review\n")
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=0, iteration=None)
+        with mock.patch.object(module, "wait_for_tmux_verdict", return_value="Verdict: PASS\n\n## BLOCKERS\n- none\n"):
+            module.cmd_capture(ns)
+        self.assertEqual(existing.read_text(), "old review\n")
+        self.assertTrue((rd / "REVIEW.iteration-1.2.md").exists())
+
+    def test_async_two_iteration_executor_review_repair_pass_cycle(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_async_two_iteration", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Async two iteration", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False, max_iterations=2))
+        run_data, rd = module.active_run(root)
+        run_data.setdefault("runner", {})["target"] = "exec:0.0"
+        run_data["runner"]["reviewer_target"] = "review:0.0"
+        run_data["awaiting"] = {"phase": "executor", "iteration": 1, "target": "exec:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        sends = []
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=0, iteration=None)
+        with mock.patch.object(module, "tmux_capture", return_value=subprocess.CompletedProcess(["tmux"], 0, "executor pass 1\n", "")), mock.patch.object(module, "tmux_send", side_effect=lambda target, prompt: sends.append((target, prompt))):
+            module.cmd_capture(ns)
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[-1][0], "review:0.0")
+        with mock.patch.object(module, "wait_for_tmux_verdict", return_value="Verdict: REVIEW_BLOCKED\n\n## BLOCKERS\n- fix async bug\n"), mock.patch.object(module, "tmux_send", side_effect=lambda target, prompt: sends.append((target, prompt))):
+            module.cmd_capture(ns)
+        self.assertEqual(sends[-1][0], "exec:0.0")
+        self.assertIn("fix async bug", sends[-1][1])
+        run_mid = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_mid["awaiting"]["phase"], "executor")
+        self.assertEqual(run_mid["awaiting"]["iteration"], 2)
+        with mock.patch.object(module, "tmux_capture", return_value=subprocess.CompletedProcess(["tmux"], 0, "executor pass 2\n", "")), mock.patch.object(module, "tmux_send", side_effect=lambda target, prompt: sends.append((target, prompt))):
+            module.cmd_capture(ns)
+        self.assertEqual(sends[-1][0], "review:0.0")
+        with mock.patch.object(module, "wait_for_tmux_verdict", return_value="Verdict: PASS\n\n## BLOCKERS\n- none\n"):
+            module.cmd_capture(ns)
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertNotIn("awaiting", run_after)
+        self.assertEqual(run_after["review"]["verdict"], "PASS")
+        self.assertTrue((rd / "REVIEW.iteration-2.md").exists())
 
 
 if __name__ == "__main__":

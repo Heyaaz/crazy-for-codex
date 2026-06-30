@@ -101,6 +101,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             "forbidden_actions": config.get("defaults", {}).get("forbidden_actions", DEFAULT_FORBIDDEN_ACTIONS),
         },
         "verification": {"commands": args.verify or []},
+        "loop": {"max_iterations": int(getattr(args, "max_iterations", 0) or config.get("loop", {}).get("max_iterations") or os.environ.get("CFC_MAX_ITERATIONS", "3"))},
         "precheck": {"branch": git_branch(root), "status_short": status_before, "changed_files": baseline_files, "dirty": bool(baseline_files)},
         "check": {},
     }
@@ -290,6 +291,10 @@ def cmd_done(args: argparse.Namespace) -> None:
         if str(review.get("verdict", "")).upper() == "REVIEW_BLOCKED":
             raise SystemExit("Independent review is REVIEW_BLOCKED. Repair blockers or use --force intentionally.")
     if not getattr(args, "no_auto_learn", False):
+        # High-severity learn candidates are never auto-applied under --force.
+        # Force-finalizing a run does not silently mutate the wiki; the only way
+        # to apply candidates under --force is the explicit --apply-learn flag
+        # (which applies ALL candidates, not only high-severity ones).
         auto_apply_high = (
             env_bool("CFC_DONE_AUTO_APPLY_HIGH_LEARN", False)
             and not args.force
@@ -304,7 +309,8 @@ def cmd_done(args: argparse.Namespace) -> None:
             auto_apply_high=auto_apply_high,
         )
         if applied_candidates:
-            print(f"Applied {len(applied_candidates)} high-confidence learn candidate(s) to .cfc/wiki")
+            mode_label = "learn" if getattr(args, "apply_learn", False) else "high-confidence learn"
+            print(f"Applied {len(applied_candidates)} {mode_label} candidate(s) to .cfc/wiki")
         elif learn_candidates:
             print(f"Wrote LEARN.md with {len(learn_candidates)} candidate(s); none auto-applied")
         else:

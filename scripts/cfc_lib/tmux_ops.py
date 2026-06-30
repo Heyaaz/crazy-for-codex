@@ -29,6 +29,9 @@ def send_tmux_prompt(run: dict[str, Any], rd: Path, ledger_phase: str, target: s
         tmux_send(target, text)
     except Exception as exc:
         run["status"] = "send_failed"
+        # A failed send must not leave a stale awaiting pointer from a prior
+        # successful dispatch; clear it atomically with the send_failed status.
+        run.pop("awaiting", None)
         run["send_error"] = {
             "phase": ledger_phase,
             "target": target,
@@ -88,7 +91,7 @@ def render_reviewer_timeout_result(target: str, timeout_seconds: int, captured_t
 def short_run_token(run_id: str) -> str:
     head = run_id.split("-", 2)
     prefix = "-".join(head[:2]) if len(head) >= 2 else slugify(run_id)[:15]
-    digest = sha256_text(run_id)[:8]
+    digest = sha256_text(run_id)[:16]
     return re.sub(r"[^A-Za-z0-9_-]+", "-", f"{prefix}-{digest}").strip("-")[:40]
 
 def tmux_has_session(session: str) -> bool:

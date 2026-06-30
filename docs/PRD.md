@@ -69,10 +69,11 @@ cfc events
 The review evidence includes `git status`, unstaged diff, staged diff, and small text untracked files. Reviewer failure or empty reviewer output is treated as `REVIEW_BLOCKED`, never PASS.
 
 Default cost-optimized config reaches OpenCode Go models through GJC and uses
-them only for execution; Codex remains the independent review authority:
+GLM 5.2 as the default executor; Codex remains the independent review
+authority and the fallback executor when GLM is unavailable or exits nonzero:
 
-- `cheap`: `gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}` for localized implementation.
-- `complex`: `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}` for broad/async/state/security/migration work.
+- `glm`: `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}` for implementation and blocker repair.
+- `codex-executor`: Codex executor for GLM command failure fallback.
 - `codex`: read-only Codex reviewer and final verdict authority.
 
 ## Data Model
@@ -153,7 +154,5 @@ A run is done only when:
 - `cfc repair`: generate repair-only prompt from BLOCKER findings.
 - command-agent mode for deterministic tests and non-interactive agent adapters.
 - tmux mode for existing GJC/Ghostty panes, with separate executor/reviewer targets.
-- coordinator adapter using `gjc_coordinator_*` tools instead of tmux.
-- read-only ingestion of `.gjc/ultragoal` and `.gjc/team` evidence.
 - stronger wiki retrieval by task tags.
 - stricter anti-feedback rules to avoid learning from previously injected wiki text.

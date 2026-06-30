@@ -53,6 +53,59 @@ def configured_profile_command(config: dict[str, Any], profile: str | None) -> s
         return str(command) if command else None
     return None
 
+def configured_executor_fallbacks(config: dict[str, Any], profile: str | None) -> list[dict[str, str]]:
+    """Return configured executor fallback attempts for a selected profile.
+
+    Fallback entries are intentionally config-driven so public repos can ship a
+    deterministic policy such as `glm -> codex-executor` without requiring
+    machine-local environment variables. Each entry is normalized to a profile
+    plus command pair that the loop can execute after a failed primary attempt.
+    """
+    if not profile:
+        return []
+    adapters = adapter_config(config)
+    fallback_map = (
+        adapters.get("fallbacks")
+        or adapters.get("executor_fallbacks")
+        or adapters.get("executorFallbacks")
+        or {}
+    )
+    if not isinstance(fallback_map, dict):
+        return []
+    raw_chain = fallback_map.get(str(profile))
+    if raw_chain is None:
+        return []
+    raw_entries = raw_chain if isinstance(raw_chain, list) else [raw_chain]
+    fallbacks: list[dict[str, str]] = []
+    seen: set[tuple[str | None, str]] = set()
+    for entry in raw_entries:
+        fallback_profile: str | None = None
+        command: str | None = None
+        if isinstance(entry, str):
+            fallback_profile = entry
+            command = configured_profile_command(config, fallback_profile)
+            if command is None and (" " in entry or entry.startswith("/") or entry.startswith(".")):
+                # Support direct command strings for local overrides while still
+                # treating simple strings as profile names by default.
+                fallback_profile = None
+                command = entry
+        elif isinstance(entry, dict):
+            raw_profile = entry.get("profile") or entry.get("name")
+            fallback_profile = str(raw_profile) if raw_profile else None
+            raw_command = entry.get("command")
+            command = str(raw_command) if raw_command else configured_profile_command(config, fallback_profile)
+        if not command:
+            continue
+        key = (fallback_profile, command)
+        if key in seen:
+            continue
+        seen.add(key)
+        item: dict[str, str] = {"command": command}
+        if fallback_profile:
+            item["profile"] = fallback_profile
+        fallbacks.append(item)
+    return fallbacks
+
 def configured_reviewer_command(config: dict[str, Any], profile: str | None = None) -> str | None:
     adapters = adapter_config(config)
     profile_name = profile or adapters.get("reviewer_profile") or adapters.get("reviewerProfile") or "codex"
@@ -78,8 +131,11 @@ def select_executor_profile(request: str, config: dict[str, Any], explicit_profi
     if profile != "auto":
         return profile
     auto = adapters.get("auto") if isinstance(adapters.get("auto"), dict) else {}
-    complex_profile = str(auto.get("complex_executor_profile") or auto.get("complexExecutorProfile") or "complex")
-    default_profile = str(auto.get("default_executor_profile") or auto.get("defaultExecutorProfile") or "cheap")
+    profiles = adapter_profiles(config)
+    complex_default = "glm" if "glm" in profiles else ("codex-executor" if "codex-executor" in profiles else "complex")
+    executor_default = "glm" if "glm" in profiles else "cheap"
+    complex_profile = str(auto.get("complex_executor_profile") or auto.get("complexExecutorProfile") or complex_default)
+    default_profile = str(auto.get("default_executor_profile") or auto.get("defaultExecutorProfile") or executor_default)
     return complex_profile if request_looks_complex(request, config) else default_profile
 
 def configured_executor_command(config: dict[str, Any], request: str, profile: str | None = None) -> tuple[str | None, str | None]:
@@ -95,6 +151,10 @@ def apply_configured_adapters(args: argparse.Namespace, root: Path) -> None:
         if command:
             args.executor_command = command
             args.executor_profile = profile
+    if getattr(args, "executor_profile", None):
+        args.executor_fallbacks = configured_executor_fallbacks(config, getattr(args, "executor_profile", None))
+    elif not hasattr(args, "executor_fallbacks"):
+        args.executor_fallbacks = []
     if not getattr(args, "reviewer_command", None):
         command = configured_reviewer_command(config, getattr(args, "reviewer_profile", None))
         if command:

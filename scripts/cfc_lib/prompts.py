@@ -161,7 +161,7 @@ def render_review_prompt(run: dict[str, Any], root: Path, rd: Path, iteration: i
     review_diff = git_review_diff(root)
     check = run.get("check", {}) or {}
     no_diff_fast_gate = check.get("verdict") == "PASS" and not check.get("changed_files")
-    executor_excerpt = latest_artifact_excerpt(rd, [f"GJC_LOG.iteration-{iteration}.md", "GJC_LOG.*.md", f"EXECUTION.iteration-{iteration}.md"])
+    executor_excerpt = latest_artifact_excerpt(rd, [f"EXECUTION.iteration-{iteration}.md", f"GJC_LOG.iteration-{iteration}.md", "GJC_LOG.*.md"])
     fast_gate = ""
     if no_diff_fast_gate:
         fast_gate = """

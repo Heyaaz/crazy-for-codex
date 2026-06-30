@@ -92,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--forbid", action="append")
     sp.add_argument("--verify", action="append")
     sp.add_argument("--tmux-target")
+    sp.add_argument("--max-iterations", type=int, default=None, help="Persist loop max_iterations for async continuation (default: config/env/3)")
     sp.add_argument("--allow-dirty", action="store_true", help="Allow starting with pre-existing dirty files as baseline evidence")
     sp.add_argument("--replace", action="store_true", help="Supersede the active run pointer with a new run")
     sp.set_defaults(func=cmd_start)

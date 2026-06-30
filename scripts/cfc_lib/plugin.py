@@ -134,6 +134,8 @@ def cmd_plugin_run(args: argparse.Namespace) -> None:
     apply_configured_adapters(ns, root_path_value)
     if args.executor_command:
         ns.executor_command = args.executor_command
+        ns.executor_profile = None
+        ns.executor_fallbacks = []
         ns.send = False
     if args.reviewer_command:
         ns.reviewer_command = args.reviewer_command

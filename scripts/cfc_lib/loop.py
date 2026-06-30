@@ -16,7 +16,7 @@ from typing import Any
 
 from .commands_core import cmd_check, cmd_diff, cmd_done, cmd_init, cmd_start
 from .common import append_ledger, env_bool, now_iso, sha256_text, write_json
-from .config import adapter_config, apply_configured_adapters, configured_executor_command, configured_reviewer_command, load_config
+from .config import adapter_config, apply_configured_adapters, configured_executor_command, configured_executor_fallbacks, configured_reviewer_command, load_config
 from .git_ops import is_git_repo, nearest_git_root
 from .learn import cmd_learn
 from .paths import cfc_path, root_path
@@ -25,6 +25,116 @@ from .review_result import extract_review_result_name, is_review_infrastructure_
 from .review_workflow import classify_review_file, run_agent_command
 from .state import active_run
 from .tmux_ops import ensure_isolated_tmux_targets, render_reviewer_timeout_result, send_tmux_prompt, tmux_capture, wait_for_tmux_verdict
+
+def next_available_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(2, 1000):
+        candidate = path.with_name(f"{stem}.{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise SystemExit(f"Refusing to overwrite existing artifact: {path}")
+
+def executor_command_attempts(args: argparse.Namespace) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    primary_command = getattr(args, "executor_command", None)
+    if primary_command:
+        attempts.append({
+            "profile": getattr(args, "executor_profile", None),
+            "command": primary_command,
+            "fallback": False,
+            "fallback_index": 0,
+        })
+    seen_commands = {primary_command} if primary_command else set()
+    for fallback_index, fallback in enumerate(getattr(args, "executor_fallbacks", []) or [], start=1):
+        profile: str | None = None
+        command: str | None = None
+        if isinstance(fallback, dict):
+            profile = str(fallback["profile"]) if fallback.get("profile") else None
+            command = str(fallback["command"]) if fallback.get("command") else None
+        elif isinstance(fallback, (list, tuple)) and len(fallback) >= 2:
+            profile = str(fallback[0]) if fallback[0] else None
+            command = str(fallback[1]) if fallback[1] else None
+        elif isinstance(fallback, str):
+            command = fallback
+        if not command or command in seen_commands:
+            continue
+        seen_commands.add(command)
+        attempts.append({
+            "profile": profile,
+            "command": command,
+            "fallback": True,
+            "fallback_index": fallback_index,
+        })
+    return attempts
+
+def execution_result_path(rd: Path, iteration: int, attempt: dict[str, Any]) -> Path:
+    if attempt.get("fallback"):
+        return next_available_path(rd / f"EXECUTION.iteration-{iteration}.fallback-{attempt.get('fallback_index')}.md")
+    return next_available_path(rd / f"EXECUTION.iteration-{iteration}.md")
+
+def write_execution_result(path: Path, attempt: dict[str, Any], res: subprocess.CompletedProcess[str]) -> None:
+    profile = attempt.get("profile") or "custom"
+    fallback = "yes" if attempt.get("fallback") else "no"
+    path.write_text(
+        f"# Execution Result\n\n"
+        f"Profile: `{profile}`\n"
+        f"Fallback: `{fallback}`\n"
+        f"Command: `{attempt['command']}`\n"
+        f"Exit: `{res.returncode}`\n\n"
+        f"## stdout\n```text\n{res.stdout}\n```\n\n"
+        f"## stderr\n```text\n{res.stderr}\n```\n",
+        encoding="utf-8",
+    )
+
+def run_executor_command_attempts(args: argparse.Namespace, prompt: str, root: Path, rd: Path, run: dict[str, Any], iteration: int) -> None:
+    attempts = executor_command_attempts(args)
+    if not attempts:
+        raise SystemExit("cfc loop requires an executor adapter: pass --executor-command or use --send with --executor-target")
+    failures: list[dict[str, Any]] = []
+    for attempt_number, attempt in enumerate(attempts, start=1):
+        command = attempt["command"]
+        res = run_agent_command(command, prompt, root, args.timeout)
+        out = execution_result_path(rd, iteration, attempt)
+        write_execution_result(out, attempt, res)
+        append_ledger(
+            rd,
+            "execute_command",
+            "pass" if res.returncode == 0 else "fail",
+            iteration=iteration,
+            attempt=attempt_number,
+            profile=attempt.get("profile"),
+            fallback=bool(attempt.get("fallback")),
+            fallback_index=attempt.get("fallback_index"),
+            exit_code=res.returncode,
+            path=str(out),
+        )
+        if res.returncode == 0:
+            run.setdefault("runner", {})["executor_last_success"] = {
+                "profile": attempt.get("profile"),
+                "command": command,
+                "fallback": bool(attempt.get("fallback")),
+                "attempt": attempt_number,
+                "artifact": str(out),
+            }
+            if attempt.get("fallback"):
+                run["runner"]["executor_fallback_used"] = run["runner"]["executor_last_success"]
+            write_json(rd / "RUN.json", run)
+            return
+        failures.append({
+            "profile": attempt.get("profile"),
+            "command": command,
+            "fallback": bool(attempt.get("fallback")),
+            "attempt": attempt_number,
+            "exit_code": res.returncode,
+            "artifact": str(out),
+        })
+    run["status"] = "execute_failed"
+    run.setdefault("runner", {})["executor_failures"] = failures
+    write_json(rd / "RUN.json", run)
+    raise SystemExit(failures[-1]["exit_code"] if failures else 1)
 
 def cmd_gjc(args: argparse.Namespace) -> None:
     root = root_path(args)
@@ -46,6 +156,18 @@ def continue_after_executor_capture(root: Path, run: dict[str, Any], rd: Path, i
     cmd_diff(argparse.Namespace(root=str(root)))
     cmd_check(argparse.Namespace(root=str(root)))
     run, rd = active_run(root)
+    check = run.get("check", {}) or {}
+    if check.get("verdict") == "FAIL" and run.get("loop", {}).get("review_on_check_fail") is False:
+        blockers = check.get("failures") or ["check failed and review_on_check_fail is disabled"]
+        parsed = {"verdict": "REVIEW_BLOCKED", "blockers": blockers, "major": [], "minor": []}
+        (rd / "BLOCKERS.md").write_text(render_blockers_md(None, parsed), encoding="utf-8")
+        run["status"] = "review_blocked"
+        run["review"] = {"verdict": "REVIEW_BLOCKED", "blockers": blockers, "review_file": None, "classified_at": now_iso()}
+        run.pop("awaiting", None)
+        write_json(rd / "RUN.json", run)
+        append_ledger(rd, "async_loop", "check_failed_no_review", iteration=iteration, blocker_count=len(blockers))
+        print("CfC check failed and review_on_check_fail is disabled. Inspect BLOCKERS.md.")
+        return
     review_prompt = render_review_prompt(run, root, rd, iteration)
     review_prompt_path = rd / f"REVIEW_PROMPT.iteration-{iteration}.md"
     review_prompt_path.write_text(review_prompt, encoding="utf-8")
@@ -58,8 +180,14 @@ def continue_after_executor_capture(root: Path, run: dict[str, Any], rd: Path, i
         append_ledger(rd, "async_loop", "waiting_for_reviewer", iteration=iteration, target=reviewer_target)
         print(f"CfC dispatched reviewer prompt to {reviewer_target} after executor capture.")
     else:
+        # No external reviewer target is configured, so the review prompt was
+        # only written to disk. Preserve an awaiting-reviewer state (with no
+        # target) so cfc done refuses until the operator classifies the review,
+        # instead of leaving the run looking like nothing is pending.
+        run["awaiting"] = {"phase": "reviewer", "iteration": iteration, "target": None, "prompt": str(review_prompt_path), "since": now_iso(), "manual": True}
+        write_json(rd / "RUN.json", run)
         append_ledger(rd, "async_loop", "review_prompt_ready", iteration=iteration, path=str(review_prompt_path))
-        print(f"Wrote reviewer prompt: {review_prompt_path}")
+        print(f"Wrote reviewer prompt (no reviewer target configured; classify manually): {review_prompt_path}")
 
 def continue_after_review_classification(root: Path, run: dict[str, Any], rd: Path, iteration: int, parsed: dict[str, Any]) -> None:
     """After async review, either stop on pass or send BLOCKERS back to executor for repair."""
@@ -107,6 +235,12 @@ def cmd_capture(args: argparse.Namespace) -> None:
     target = args.tmux_target or awaiting.get("target") or run.get("runner", {}).get("target") or "gjc:0.0"
     wait_for_verdict = args.wait_verdict or (is_awaiting_reviewer and not args.no_wait_verdict)
     if wait_for_verdict:
+        if not args.timeout_seconds:
+            # timeout-seconds 0 means wait indefinitely for a final Verdict line.
+            # Flag this explicitly so the operator knows the capture will not
+            # time out and must be interrupted manually if the reviewer hangs.
+            append_ledger(rd, "capture_wait", "infinite_wait", target=target, timeout_seconds=0)
+            print(f"cfc capture: --timeout-seconds 0 means waiting indefinitely for a final Verdict from {target}; interrupt manually if the reviewer hangs.")
         append_ledger(rd, "capture_wait", "start", target=target, timeout_seconds=args.timeout_seconds)
         try:
             text = wait_for_tmux_verdict(target, args.lines, poll_seconds=args.poll_seconds, timeout_seconds=args.timeout_seconds)
@@ -123,13 +257,18 @@ def cmd_capture(args: argparse.Namespace) -> None:
             append_ledger(rd, "capture", "fail", target=target, error=p.stderr.strip())
             raise SystemExit(p.stderr.strip())
         text = p.stdout
-    out = rd / f"GJC_LOG.{dt.datetime.now().strftime('%H%M%S')}.md"
-    out.write_text("# GJC Captured Log\n\n```text\n" + text + "\n```\n", encoding="utf-8")
+    capture_iteration = int(awaiting.get("iteration") or args.iteration or 1)
+    if is_awaiting_executor and not args.tmux_target:
+        out = next_available_path(rd / f"EXECUTION.iteration-{capture_iteration}.md")
+        out.write_text("# Execution Result\n\nCommand: `tmux capture`\nExit: `0`\n\n## stdout\n```text\n" + text + "\n```\n\n## stderr\n```text\n\n```\n", encoding="utf-8")
+    else:
+        out = next_available_path(rd / f"GJC_LOG.{dt.datetime.now().strftime('%H%M%S')}.md")
+        out.write_text("# GJC Captured Log\n\n```text\n" + text + "\n```\n", encoding="utf-8")
     append_ledger(rd, "capture", "done", target=target, path=str(out), waited_for_verdict=wait_for_verdict)
     print(f"Captured tmux log: {out}")
     if wait_for_verdict and is_awaiting_reviewer:
         iteration = int(awaiting.get("iteration") or args.iteration or 1)
-        review_path = rd / extract_review_result_name(iteration)
+        review_path = next_available_path(rd / extract_review_result_name(iteration))
         review_path.write_text(text, encoding="utf-8")
         parsed = classify_review_file(root, run, rd, review_path)
         print(json.dumps(parsed, indent=2, ensure_ascii=False))
@@ -151,6 +290,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
     start_args = argparse.Namespace(
         root=str(root), title=args.request, allow=args.allow, forbid=args.forbid, verify=args.verify,
         tmux_target=args.executor_target, allow_dirty=args.allow_dirty, replace=args.replace,
+        max_iterations=args.max_iterations,
     )
     cmd_start(start_args)
     run, rd = active_run(root)
@@ -162,6 +302,11 @@ def cmd_loop(args: argparse.Namespace) -> None:
     if args.send:
         run.setdefault("runner", {})["target"] = args.executor_target
         run["runner"]["reviewer_target"] = args.reviewer_target
+    elif args.executor_command:
+        run.setdefault("runner", {})["executor_profile"] = getattr(args, "executor_profile", None)
+        run["runner"]["executor_command"] = args.executor_command
+        run["runner"]["executor_fallbacks"] = getattr(args, "executor_fallbacks", []) or []
+        run["runner"]["reviewer_profile"] = getattr(args, "reviewer_profile", None)
     write_json(rd / "RUN.json", run)
     final_parsed = {"verdict": "UNKNOWN", "blockers": []}
     for iteration in range(1, args.max_iterations + 1):
@@ -180,14 +325,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
             prompt_path.write_text(prompt, encoding="utf-8")
         append_ledger(rd, "execute_prompt", "done", iteration=iteration, path=str(prompt_path))
         if args.executor_command:
-            res = run_agent_command(args.executor_command, prompt, root, args.timeout)
-            out = rd / f"EXECUTION.iteration-{iteration}.md"
-            out.write_text(f"# Execution Result\n\nCommand: `{args.executor_command}`\nExit: `{res.returncode}`\n\n## stdout\n```text\n{res.stdout}\n```\n\n## stderr\n```text\n{res.stderr}\n```\n", encoding="utf-8")
-            append_ledger(rd, "execute_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode, path=str(out))
-            if res.returncode != 0:
-                run["status"] = "execute_failed"
-                write_json(rd / "RUN.json", run)
-                raise SystemExit(res.returncode)
+            run_executor_command_attempts(args, prompt, root, rd, run, iteration)
         elif args.send:
             send_tmux_prompt(run, rd, "execute_send", args.executor_target, prompt, iteration=iteration)
             if not args.tmux_wait_seconds:
@@ -199,7 +337,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
                 return
             subprocess.run(["sleep", str(args.tmux_wait_seconds)], check=False)
             cap = subprocess.run(["tmux", "capture-pane", "-t", args.executor_target, "-p", "-S", f"-{args.capture_lines}"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            (rd / f"GJC_LOG.iteration-{iteration}.md").write_text("# GJC Captured Log\n\n```text\n" + cap.stdout + "\n```\n", encoding="utf-8")
+            (rd / f"EXECUTION.iteration-{iteration}.md").write_text("# Execution Result\n\nCommand: `tmux capture`\nExit: `" + str(cap.returncode) + "`\n\n## stdout\n```text\n" + cap.stdout + "\n```\n\n## stderr\n```text\n" + cap.stderr + "\n```\n", encoding="utf-8")
         else:
             print(f"Wrote executor prompt for iteration {iteration}: {prompt_path}")
         cmd_diff(argparse.Namespace(root=str(root)))
@@ -267,11 +405,14 @@ def cmd_loop(args: argparse.Namespace) -> None:
         repair_path.write_text(repair_prompt, encoding="utf-8")
         append_ledger(rd, "repair_prompt", "done", iteration=iteration, path=str(repair_path), blocker_count=len(blockers))
     run, rd = active_run(root)
-    cmd_learn(argparse.Namespace(root=str(root), apply=args.apply_learn))
-    run, rd = active_run(root)
-    if run.get("status") != "review_blocked" and run.get("check", {}).get("verdict") != "FAIL" and not final_parsed.get("blockers"):
-        cmd_done(argparse.Namespace(root=str(root), force=False))
+    happy = run.get("status") != "review_blocked" and run.get("check", {}).get("verdict") != "FAIL" and not final_parsed.get("blockers")
+    if happy:
+        # cmd_done already runs run_learn (and honors --apply-learn). Do not
+        # run cmd_learn separately here: that would double-write LEARN.md and
+        # double-append the wiki log for every successful loop.
+        cmd_done(argparse.Namespace(root=str(root), force=False, apply_learn=args.apply_learn))
     else:
+        cmd_learn(argparse.Namespace(root=str(root), apply=args.apply_learn))
         print("CfC loop ended review_blocked/failed. Inspect BLOCKERS.md and run artifacts.")
 
 def default_loop_namespace(request: str, root: str = ".", replace: bool = False, allow_dirty: bool = False) -> argparse.Namespace:
@@ -280,6 +421,7 @@ def default_loop_namespace(request: str, root: str = ".", replace: bool = False,
     adapters = adapter_config(config)
     mode = str(adapters.get("mode") or "tmux")
     executor_command, executor_profile = configured_executor_command(config, request)
+    executor_fallbacks = configured_executor_fallbacks(config, executor_profile)
     reviewer_command = configured_reviewer_command(config)
     command_mode = mode == "command" or bool(executor_command or reviewer_command)
     return argparse.Namespace(
@@ -296,6 +438,7 @@ def default_loop_namespace(request: str, root: str = ".", replace: bool = False,
         capture_lines=int(adapters.get("capture_lines") or adapters.get("captureLines") or os.environ.get("CFC_CAPTURE_LINES", "5000")),
         isolated_tmux=bool(adapters.get("isolated_tmux", adapters.get("isolatedTmux", env_bool("CFC_ISOLATED_TMUX", True)))),
         executor_command=executor_command or os.environ.get("CFC_EXECUTOR_COMMAND") or None,
+        executor_fallbacks=executor_fallbacks,
         reviewer_command=reviewer_command or os.environ.get("CFC_REVIEWER_COMMAND") or None,
         executor_profile=executor_profile,
         reviewer_profile=adapters.get("reviewer_profile") or adapters.get("reviewerProfile") or "codex",

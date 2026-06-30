@@ -22,7 +22,7 @@ def parse_review_result(text: str) -> dict[str, Any]:
     if not text.strip():
         return {"verdict": "REVIEW_BLOCKED", "blockers": ["review produced no output"], "major": [], "minor": []}
     verdict_match = re.search(r"(?im)^\s*Verdict\s*:\s*([A-Z_]+)", text)
-    verdict = verdict_match.group(1).upper() if verdict_match else "REVIEW_BLOCKED"
+    raw_verdict = verdict_match.group(1).upper() if verdict_match else None
 
     def section_items(name: str) -> list[str]:
         m = re.search(rf"(?ims)^##\s*{re.escape(name)}\s*$\n(.*?)(?=^##\s+|\Z)", text)
@@ -47,13 +47,22 @@ def parse_review_result(text: str) -> dict[str, Any]:
     blockers = section_items("BLOCKERS") or section_items("BLOCKER")
     major = section_items("MAJOR")
     minor = section_items("MINOR")
-    if not verdict_match:
+    # Strict canonicalization: only the literal `Verdict: PASS` is a pass.
+    # Missing or noncanonical verdicts (FAIL, BLOCKED, needs_review, etc.)
+    # and REVIEW_BLOCKED all collapse to REVIEW_BLOCKED with an explanatory blocker.
+    if raw_verdict is None:
         blockers = ["review missing required final Verdict line"] + blockers
-    elif verdict not in {"PASS", "REVIEW_BLOCKED"}:
-        blockers = [f"review returned unsupported Verdict: {verdict}; expected PASS or REVIEW_BLOCKED"] + blockers
-    elif verdict == "REVIEW_BLOCKED" and not blockers:
-        blockers = ["review returned REVIEW_BLOCKED without parsed BLOCKERS"]
-    blocked = verdict == "REVIEW_BLOCKED" or bool(blockers)
+    elif raw_verdict == "PASS":
+        # PASS with any parsed BLOCKER is contradictory; treat as blocked so the
+        # loop does not silently accept a self-contradictory review.
+        if blockers:
+            blockers = ["review returned PASS but also listed BLOCKERS"] + blockers
+    elif raw_verdict == "REVIEW_BLOCKED":
+        if not blockers:
+            blockers = ["review returned REVIEW_BLOCKED without parsed BLOCKERS"]
+    else:
+        blockers = [f"review returned unsupported Verdict: {raw_verdict}; expected PASS or REVIEW_BLOCKED"] + blockers
+    blocked = raw_verdict != "PASS" or bool(blockers)
     return {"verdict": "REVIEW_BLOCKED" if blocked else "PASS", "blockers": blockers, "major": major, "minor": minor}
 
 def is_review_infrastructure_blocker(blockers: list[str]) -> bool:
