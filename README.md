@@ -13,6 +13,10 @@ Codex / OMX / GJC plugin UI
 ```
 
 CfC does **not** mutate `.gjc/` state. `.gjc/` remains GJC runtime state; `.cfc/` is the external control/learning layer.
+JSON state and ledger writes under `.cfc/**` go through CfC's state writer:
+JSON files are written by same-directory temp file plus atomic replace, ledger
+events are fsynced after append, and symlink/path escapes out of `.cfc` are
+rejected.
 
 ## Plugin surface
 
@@ -63,11 +67,15 @@ cost-optimized command-mode default:
   - all executor tasks -> `glm` -> `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}`
   - GLM command failure (quota/rate/auth/timeout/nonzero exit) -> `codex-executor` fallback
 - reviewer profile `codex` -> `codex exec --sandbox read-only -`
+- optional executor profile `gjc-rpc` -> `gjc --mode rpc` using JSONL stdio frames
 
 The reviewer remains the only final PASS/REVIEW_BLOCKED authority; OpenCode Go models
 are reached through GJC and used only as executors. `{prompt_file}` is expanded by CfC
 to a temporary prompt file so GJC can receive long prompts as `@file` input instead
 of oversized shell argv/stdin assumptions.
+When a command contains `--mode rpc`, CfC uses the GJC RPC runner instead of
+raw stdin: it waits for `{ "type": "ready" }`, sends a `prompt` command,
+waits for an agent completion event, then requests `get_last_assistant_text`.
 
 Live command adapters (`gjc`, `opencode`, and nested `codex exec`) should run
 from an external terminal or tmux pane, not from the Codex App sandbox. These
@@ -86,7 +94,8 @@ in an environment with writable runtime homes, set
     "profiles": {
       "glm": { "command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}" },
       "codex-executor": { "command": "codex exec --dangerously-bypass-approvals-and-sandbox -" },
-      "codex": { "command": "codex exec --sandbox read-only -" }
+      "codex": { "command": "codex exec --sandbox read-only -" },
+      "gjc-rpc": { "protocol": "jsonl-rpc", "command": "gjc --mode rpc" }
     },
     "auto": {
       "default_executor_profile": "glm",
@@ -182,6 +191,24 @@ Workers must not create final reports in the repository root. A newly-created ro
 
 Nested or legitimate project files named `DONE.md` are not globally forbidden. For example, `src/DONE.md` is allowed when it is inside the run's allowed paths.
 
+Before `DONE.md` is written, CfC writes `.cfc/runs/<run-id>/QUALITY_GATE.json`.
+The quality gate records required completion criteria, their backing artifact
+references, SHA-256 hashes, and pass/fail coverage. A normal `cfc done` refuses
+if required artifacts such as `CHECK.md` or classified review evidence are
+missing, outside the run directory, or empty. `--force` still records the gate
+as `FORCED` instead of hiding the failed criteria.
+
+Executor evidence receipts are validated separately in
+`.cfc/runs/<run-id>/EVIDENCE_RECEIPTS.json`. Executor prompts ask agents to
+write concise proof under `.cfc/runs/<run-id>/evidence/` and include:
+
+```text
+CFC_EVIDENCE_RECORDED: .cfc/runs/<run-id>/evidence/<file>
+```
+
+Set `CFC_REQUIRE_EVIDENCE_RECEIPTS=1` or `"evidence": {"require_receipts": true}`
+to make missing/invalid receipts a blocking DONE criterion for changed runs.
+
 ## Learning
 
 `done` and `learn` are separate concerns:
@@ -192,6 +219,11 @@ REVIEW_BLOCKED -> LEARN.md -> high-confidence process/system failures may still 
 ```
 
 This means blocked/failed runs can still preserve useful process lessons without falsely marking the task complete.
+
+Prompt-time wiki injection is bounded and de-duplicated. CfC records injected
+source ids in `WIKI_CONTEXT.md` / `RUN.json`, skips wiki blocks already present
+in prior executor/repair prompts for the same run, and caps total wiki body
+text with `CFC_WIKI_CONTEXT_MAX_CHARS` or the built-in prompt-pressure budget.
 
 ## Manual primitives
 
@@ -250,6 +282,9 @@ events          print ledger.jsonl events
     EXECUTION.iteration-1.fallback-1.md # optional executor fallback output
     DIFF.md
     CHECK.md
+    EVIDENCE_RECEIPTS.json
+    QUALITY_GATE.json
+    evidence/
     REVIEW_PROMPT.iteration-1.md
     REVIEW.iteration-1.md
     BLOCKERS.md

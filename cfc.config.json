@@ -22,6 +22,12 @@
         "model": "codex-default",
         "command": "codex exec --sandbox read-only -",
         "purpose": "Strict independent reviewer. Keep final PASS/REVIEW_BLOCKED authority here."
+      },
+      "gjc-rpc": {
+        "provider": "gjc",
+        "protocol": "jsonl-rpc",
+        "command": "gjc --mode rpc",
+        "purpose": "Experimental typed JSONL GJC adapter. CfC sends prompt frames and consumes completion/state frames instead of scraping a tmux transcript."
       }
     },
     "auto": {

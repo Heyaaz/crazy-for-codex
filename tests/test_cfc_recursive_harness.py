@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -49,6 +50,96 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         res = run(["done", "--root", str(root)])
         self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_done_writes_quality_gate_artifact(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Quality gate", "--allow", "src/app.py", "--verify", "python3 -m py_compile src/app.py"])
+        (root / "src" / "app.py").write_text("print('quality')\n")
+        self.assertEqual(run(["check", "--root", str(root)]).returncode, 0)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        review = rd / "REVIEW.iteration-1.md"
+        review.write_text("Verdict: PASS\n\n## BLOCKERS\n- none\n")
+        self.assertEqual(run(["classify-review", "--root", str(root), "--review-file", str(review)]).returncode, 0)
+        res = run(["done", "--root", str(root)])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        gate = json.loads((rd / "QUALITY_GATE.json").read_text())
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(gate["status"], "PASS")
+        self.assertEqual(gate["coverage"]["required"], gate["coverage"]["passed"])
+        self.assertEqual(run_data["quality_gate"]["status"], "PASS")
+        self.assertIn("QUALITY_GATE.json: PASS", (rd / "DONE.md").read_text())
+
+    def test_done_refuses_empty_review_artifact_even_if_classified_pass(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Empty review artifact", "--allow", "src/app.py"])
+        (root / "src" / "app.py").write_text("print('changed')\n")
+        self.assertEqual(run(["check", "--root", str(root)]).returncode, 0)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        review = rd / "REVIEW.iteration-1.md"
+        review.write_text("Verdict: PASS\n\n## BLOCKERS\n- none\n")
+        self.assertEqual(run(["classify-review", "--root", str(root), "--review-file", str(review)]).returncode, 0)
+        review.write_text("")
+        res = run(["done", "--root", str(root)])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Quality gate failed", res.stderr)
+        gate = json.loads((rd / "QUALITY_GATE.json").read_text())
+        self.assertEqual(gate["status"], "FAIL")
+        self.assertTrue(any("independent_review" in blocker for blocker in gate["blockers"]))
+
+    def test_required_evidence_receipt_blocks_done_when_missing(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        env = os.environ.copy()
+        env["CFC_REQUIRE_EVIDENCE_RECEIPTS"] = "1"
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Require evidence", "--allow", "src/app.py"], env=env)
+        (root / "src" / "app.py").write_text("print('changed')\n")
+        self.assertEqual(run(["check", "--root", str(root)]).returncode, 0)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        review = rd / "REVIEW.iteration-1.md"
+        review.write_text("Verdict: PASS\n\n## BLOCKERS\n- none\n")
+        self.assertEqual(run(["classify-review", "--root", str(root), "--review-file", str(review)]).returncode, 0)
+        res = run(["done", "--root", str(root)])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Quality gate failed", res.stderr)
+        receipts = json.loads((rd / "EVIDENCE_RECEIPTS.json").read_text())
+        self.assertEqual(receipts["status"], "FAIL")
+        self.assertIn("no CFC_EVIDENCE_RECORDED line", "\n".join(receipts["blockers"]))
+
+    def test_required_evidence_receipt_accepts_valid_evidence_file(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        env = os.environ.copy()
+        env["CFC_REQUIRE_EVIDENCE_RECEIPTS"] = "1"
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Valid evidence", "--allow", "src/app.py"], env=env)
+        (root / "src" / "app.py").write_text("print('changed')\n")
+        self.assertEqual(run(["check", "--root", str(root)]).returncode, 0)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        evidence = rd / "evidence" / "executor.txt"
+        evidence.write_text("changed src/app.py and ran cfc check\n")
+        (rd / "EXECUTION.iteration-1.md").write_text(
+            "# Execution Result\n\n"
+            f"CFC_EVIDENCE_RECORDED: .cfc/runs/{cur['run_id']}/evidence/executor.txt\n"
+        )
+        review = rd / "REVIEW.iteration-1.md"
+        review.write_text("Verdict: PASS\n\n## BLOCKERS\n- none\n")
+        self.assertEqual(run(["classify-review", "--root", str(root), "--review-file", str(review)]).returncode, 0)
+        res = run(["done", "--root", str(root)])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        receipts = json.loads((rd / "EVIDENCE_RECEIPTS.json").read_text())
+        gate = json.loads((rd / "QUALITY_GATE.json").read_text())
+        self.assertEqual(receipts["status"], "PASS")
+        self.assertEqual(receipts["receipts"][0]["sha256"], hashlib.sha256(evidence.read_bytes()).hexdigest())
+        self.assertTrue(any(item["id"] == "evidence_receipts" and item["status"] == "pass" for item in gate["criteria"]))
 
     def test_done_refuses_changed_run_without_independent_review(self):
         td, root = self.make_repo()
@@ -298,6 +389,64 @@ class CfCTest(unittest.TestCase):
         self.assertIn("tags: lineage, reviewer", item["reason"])
         self.assertIn(item["source_id"], context)
         self.assertIn(f"CFC:WIKI-SOURCE {item['source_id']} BEGIN", prompt)
+
+    def test_wiki_prompt_dedupes_source_already_in_prior_prompt(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        gd = root / ".cfc" / "wiki" / "guardrails"
+        gd.mkdir(parents=True, exist_ok=True)
+        (gd / "payload.md").write_text(
+            "---\n"
+            "type: Guardrail\n"
+            "title: Payload stability\n"
+            "tags: [payload]\n"
+            "status: active\n"
+            "---\n"
+            "# Prompt Patch\n"
+            "Keep payload stable.\n"
+        )
+        run(["start", "--root", str(root), "Payload task"])
+        self.assertEqual(run(["gjc", "--root", str(root), "payload"]).returncode, 0)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        first_prompt = (rd / "PROMPT.iteration-1.md").read_text()
+        self.assertIn("Keep payload stable", first_prompt)
+        self.assertEqual(run(["gjc", "--root", str(root), "--iteration", "2", "payload again"]).returncode, 0)
+        second_prompt = (rd / "PROMPT.iteration-2.md").read_text()
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertNotIn("Keep payload stable", second_prompt)
+        self.assertTrue(run_data["wiki_context"]["budget"]["skipped_already_in_transcript"])
+
+    def test_wiki_prompt_respects_context_budget(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        gd = root / ".cfc" / "wiki" / "guardrails"
+        gd.mkdir(parents=True, exist_ok=True)
+        (gd / "long-memory.md").write_text(
+            "---\n"
+            "type: Guardrail\n"
+            "title: Long payload memory\n"
+            "tags: [longpayload]\n"
+            "status: active\n"
+            "---\n"
+            "# Prompt Patch\n"
+            + ("A" * 600)
+            + "TAIL_MARKER\n"
+        )
+        run(["start", "--root", str(root), "Long payload task"])
+        env = os.environ.copy()
+        env["CFC_WIKI_CONTEXT_MAX_CHARS"] = "360"
+        self.assertEqual(run(["gjc", "--root", str(root), "longpayload"], env=env).returncode, 0)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        prompt = (rd / "PROMPT.iteration-1.md").read_text()
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertIn("Long payload memory", prompt)
+        self.assertNotIn("TAIL_MARKER", prompt)
+        self.assertEqual(run_data["wiki_context"]["budget"]["max_chars"], 360)
+        self.assertTrue(run_data["wiki_context"]["budget"]["truncated_by_budget"])
 
     def test_wiki_prompt_blocks_are_untrusted_against_prompt_injection(self):
         td, root = self.make_repo()
@@ -648,6 +797,41 @@ class CfCTest(unittest.TestCase):
                 offenders.append(str(path.relative_to(SCRIPT.parents[1])))
         self.assertEqual(offenders, [])
 
+    def test_state_writer_writes_json_and_ledger_without_temp_leftovers(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_state_writer", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        rd = root / ".cfc" / "runs" / "run-1"
+        module.write_json(rd / "RUN.json", {"ok": True})
+        module.append_ledger(rd, "test", "done", value=1)
+        self.assertEqual(json.loads((rd / "RUN.json").read_text())["ok"], True)
+        events = [(json.loads(line)) for line in (rd / "ledger.jsonl").read_text().splitlines()]
+        self.assertEqual(events[0]["phase"], "test")
+        self.assertFalse(list(rd.glob(".*.tmp")))
+
+    def test_state_writer_rejects_cfc_symlink_escape(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_state_escape", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        outside = root / "outside"
+        outside.mkdir()
+        cfc = root / ".cfc"
+        cfc.mkdir()
+        (cfc / "escape").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            module.write_json(cfc / "escape" / "RUN.json", {"bad": True})
+        self.assertFalse((outside / "RUN.json").exists())
+
     def test_repo_default_config_uses_gjc_opencode_go_profiles(self):
         config = json.loads((SCRIPT.parents[1] / "cfc.config.json").read_text(encoding="utf-8"))
         profiles = config["adapters"]["profiles"]
@@ -660,6 +844,9 @@ class CfCTest(unittest.TestCase):
         self.assertIn("@{prompt_file}", profiles["glm"]["command"])
         self.assertEqual(profiles["codex-executor"]["provider"], "codex")
         self.assertIn("codex exec --dangerously-bypass-approvals-and-sandbox -", profiles["codex-executor"]["command"])
+        self.assertEqual(profiles["gjc-rpc"]["provider"], "gjc")
+        self.assertEqual(profiles["gjc-rpc"]["protocol"], "jsonl-rpc")
+        self.assertEqual(profiles["gjc-rpc"]["command"], "gjc --mode rpc")
         self.assertNotIn("k2.7-code", json.dumps(config))
         self.assertNotIn("opencode run", json.dumps(config))
 
@@ -677,6 +864,36 @@ class CfCTest(unittest.TestCase):
         self.assertIn("hello from prompt file", res.stdout)
         self.assertFalse(path.exists())
 
+    def test_agent_command_uses_gjc_rpc_jsonl_when_mode_rpc(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_rpc_command", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        root = Path(td.name)
+        seen = root / "seen.txt"
+        rpc = root / "fake_rpc.py"
+        rpc.write_text(
+            "import json, pathlib, sys\n"
+            f"seen = pathlib.Path({str(seen)!r})\n"
+            "print(json.dumps({'type': 'ready'}), flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    frame = json.loads(line)\n"
+            "    if frame.get('type') == 'prompt':\n"
+            "        seen.write_text(frame.get('message', ''))\n"
+            "        print(json.dumps({'id': frame.get('id'), 'type': 'response', 'command': 'prompt', 'success': True}), flush=True)\n"
+            "        print(json.dumps({'type': 'event', 'event': {'kind': 'rpc_agent_completed'}}), flush=True)\n"
+            "    elif frame.get('type') == 'get_last_assistant_text':\n"
+            "        print(json.dumps({'id': frame.get('id'), 'type': 'response', 'command': 'get_last_assistant_text', 'success': True, 'data': {'text': 'rpc done'}}), flush=True)\n",
+            encoding="utf-8",
+        )
+        res = module.run_agent_command(f"{sys.executable} {rpc} --mode rpc", "hello rpc", root, 5)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "rpc done")
+        self.assertEqual(seen.read_text(), "hello rpc")
+
     def test_plugin_manifest_is_machine_readable(self):
         res = run(["plugin", "manifest"])
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -684,6 +901,7 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(manifest["name"], "cfc")
         self.assertIn("run", manifest["commands"])
         self.assertIn("status", manifest["commands"])
+        self.assertEqual(manifest["adapter_protocols"]["gjc-rpc"]["transport"], "jsonl-stdio")
 
     def test_plugin_status_reports_active_run_json(self):
         td, root = self.make_repo()

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import append_ledger, env_bool, now_iso, write_json
+from .gjc_rpc import command_looks_like_gjc_rpc, run_gjc_rpc_command
 from .learn import run_learn
 from .paths import root_path
 from .prompts import render_blockers_md, render_repair_prompt
@@ -24,6 +25,8 @@ from .state import active_run
 from .tmux_ops import send_tmux_prompt
 
 def run_agent_command(command: str, prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    if command_looks_like_gjc_rpc(command):
+        return run_gjc_rpc_command(command, prompt, cwd, timeout)
     prompt_file: Path | None = None
     stdin = prompt
     if "{prompt_file}" in command:

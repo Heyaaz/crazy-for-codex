@@ -27,6 +27,8 @@ def format_list(items: list[str]) -> str:
 def render_task(run: dict[str, Any]) -> str:
     g = run["guardrails"]
     v = run["verification"]
+    evidence = run.get("evidence", {}) or {}
+    receipt_mode = "required" if evidence.get("require_receipts") else "requested"
     return f"""# CfC Task: {run['title']}
 
 ## Goal
@@ -63,6 +65,7 @@ def render_task(run: dict[str, Any]) -> str:
 - No forbidden files changed.
 - Configured verification commands pass or the reason is explicitly recorded.
 - Independent review has no BLOCKER findings for risky changes.
+- Evidence receipt is {receipt_mode}: write concise evidence under `.cfc/runs/{run['id']}/evidence/` and report `CFC_EVIDENCE_RECORDED: <path>` when changing files or running verification.
 - CfC controller writes final artifacts under `.cfc/runs/<run-id>/`; workers must not create root-level `DONE.md`.
 """
 
@@ -145,7 +148,77 @@ def render_wiki_context(run: dict[str, Any], mode: str, items: list[dict[str, An
         )
     return "\n".join(parts) + "\n"
 
-def record_wiki_context(run: dict[str, Any], root: Path, mode: str, wiki: dict[str, list[tuple[str, str, dict[str, Any]]]]) -> None:
+def wiki_source_id(section: str, title: str, body: str, provenance: dict[str, Any]) -> str:
+    return str(provenance.get("source_id") or sha256_text(f"{section}\n{title}\n{body}")[:16])
+
+
+def prior_prompt_wiki_sources(rd: Path) -> set[str]:
+    seen: set[str] = set()
+    for pattern in ["PROMPT.iteration-*.md", "REPAIR_PROMPT.iteration-*.md"]:
+        for path in sorted(rd.glob(pattern)):
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            seen.update(re.findall(r"CFC:WIKI-SOURCE\s+([A-Za-z0-9_-]+)\s+BEGIN", text))
+    return seen
+
+
+def wiki_context_char_budget(run: dict[str, Any], user_request: str) -> int:
+    explicit = os.environ.get("CFC_WIKI_CONTEXT_MAX_CHARS")
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except ValueError:
+            return 6000
+    prompt_pressure = len(str(run.get("title") or "")) + len(user_request) + len(json.dumps(run.get("guardrails", {}), ensure_ascii=False))
+    if prompt_pressure > 24000:
+        return 1500
+    if prompt_pressure > 12000:
+        return 3000
+    return 6000
+
+
+def budget_wiki_context(
+    rd: Path,
+    wiki: dict[str, list[tuple[str, str, dict[str, Any]]]],
+    max_chars: int,
+) -> tuple[dict[str, list[tuple[str, str, dict[str, Any]]]], dict[str, Any]]:
+    seen = prior_prompt_wiki_sources(rd)
+    out: dict[str, list[tuple[str, str, dict[str, Any]]]] = {key: [] for key in wiki}
+    used = 0
+    skipped_seen: list[str] = []
+    skipped_budget: list[str] = []
+    truncated: list[str] = []
+    for section, entries in wiki.items():
+        for title, body, provenance in entries:
+            source_id = wiki_source_id(section, title, body, provenance)
+            if source_id in seen:
+                skipped_seen.append(source_id)
+                continue
+            fixed_cost = len(title) + len(str(provenance.get("path") or "")) + 120
+            remaining = max_chars - used - fixed_cost
+            if remaining <= 0:
+                skipped_budget.append(source_id)
+                continue
+            next_body = body
+            if len(next_body) > remaining:
+                if remaining < 160:
+                    skipped_budget.append(source_id)
+                    continue
+                next_body = next_body[:remaining].rstrip() + "\n...[truncated by CFC wiki budget]"
+                truncated.append(source_id)
+            used += fixed_cost + len(next_body)
+            out[section].append((title, next_body, provenance))
+    return out, {
+        "max_chars": max_chars,
+        "used_chars": used,
+        "skipped_already_in_transcript": skipped_seen,
+        "skipped_by_budget": skipped_budget,
+        "truncated_by_budget": truncated,
+    }
+
+
+def record_wiki_context(run: dict[str, Any], root: Path, mode: str, wiki: dict[str, list[tuple[str, str, dict[str, Any]]]], metadata: dict[str, Any] | None = None) -> None:
     if not run.get("id"):
         return
     rd = runs_dir(root) / run["id"]
@@ -158,6 +231,7 @@ def record_wiki_context(run: dict[str, Any], root: Path, mode: str, wiki: dict[s
         "mode": mode,
         "artifact": str(rd / "WIKI_CONTEXT.md"),
         "items": items,
+        "budget": metadata or {},
     }
     write_json(rd / "RUN.json", run)
 
@@ -171,7 +245,9 @@ def build_prompt(run: dict[str, Any], root: Path, user_request: str, mode: str =
         " ".join(g.get("forbidden_paths", []) or []),
     ])
     wiki = collect_active_wiki(root, task_text=wiki_context)
-    record_wiki_context(run, root, mode, wiki)
+    rd = runs_dir(root) / run["id"]
+    wiki, wiki_budget = budget_wiki_context(rd, wiki, wiki_context_char_budget(run, user_request))
+    record_wiki_context(run, root, mode, wiki, wiki_budget)
     sections: list[str] = []
     sections.append(f"# CfC {mode.title()} Prompt")
     sections.append(f"Repository: {root}")
@@ -186,6 +262,7 @@ def build_prompt(run: dict[str, Any], root: Path, user_request: str, mode: str =
     sections.append("- Do not write final reports into repository files. Report in the chat/pane only; CfC controller owns `.cfc/runs/<run-id>/DONE.md`.")
     sections.append("- Do not install dependencies, format the whole repo, stage, commit, or push.")
     sections.append("- Do not claim completion until verification commands ran or you explicitly explain why they cannot run.")
+    sections.append(f"- When you change files or run verification, write concise evidence under `.cfc/runs/{run['id']}/evidence/` and include `CFC_EVIDENCE_RECORDED: <path>` in your final report.")
     sections.append("- If you find extra work, put it in Parking Lot; do not mix it into the current task.")
     sections.append(render_minimality_gate())
     sections.append("## Allowed Paths")
@@ -321,6 +398,7 @@ Do not broaden scope, refactor unrelated code, install dependencies, stage, comm
 Do not create or edit root-level `DONE.md` or any repository report file; report results in the chat/pane only.
 Keep existing task contract and allowed/forbidden paths.
 After the repair, run the configured verification commands and report exact results.
+When you change files or run verification, write concise evidence under `.cfc/runs/{run['id']}/evidence/` and include `CFC_EVIDENCE_RECORDED: <path>` in the final report.
 
 {render_minimality_gate()}
 

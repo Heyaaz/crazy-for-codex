@@ -62,6 +62,8 @@ def run_summary(root: Path) -> dict[str, Any]:
             "send_error": run.get("send_error"),
             "check": run.get("check", {}),
             "review": run.get("review", {}),
+            "evidence": run.get("evidence", {}),
+            "quality_gate": run.get("quality_gate", {}),
             "recent_events": ledger_events,
         }
     return payload
@@ -81,6 +83,14 @@ def cmd_plugin_manifest(args: argparse.Namespace) -> None:
         },
         "config": {
             "adapters": "Use adapters.mode=command plus executor_profile/reviewer_profile/profiles for cost-optimized model routing.",
+        },
+        "adapter_protocols": {
+            "gjc-rpc": {
+                "status": "experimental",
+                "command": "gjc --mode rpc",
+                "transport": "jsonl-stdio",
+                "completion": "agent_end/agent_completed/rpc_agent_completed event plus get_last_assistant_text",
+            }
         },
         "env": [
             "CFC_EXECUTOR_COMMAND", "CFC_REVIEWER_COMMAND", "CFC_EXECUTOR_TARGET", "CFC_REVIEWER_TARGET",

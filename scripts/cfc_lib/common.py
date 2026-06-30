@@ -62,15 +62,15 @@ def read_json(path: Path, default: Any = _MISSING) -> Any:
         raise
 
 def write_json(path: Path, data: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    from .state_writer import write_json_atomic
+
+    write_json_atomic(path, data)
 
 def append_ledger(run_dir: Path, phase: str, status: str, **data: Any) -> None:
+    from .state_writer import append_jsonl
+
     event = {"ts": now_iso(), "phase": phase, "status": status, **data}
-    path = run_dir / "ledger.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    append_jsonl(run_dir / "ledger.jsonl", event)
 
 def run_cmd(cmd: list[str], cwd: Path, check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=str(cwd), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check)

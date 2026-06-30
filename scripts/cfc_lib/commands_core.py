@@ -17,10 +17,12 @@ from typing import Any
 from .common import append_ledger, env_bool, match_any, now_iso, sha256_text, shell_cmd, slugify, write_json
 from .config import load_config
 from .constants import DEFAULT_FORBIDDEN_ACTIONS, DEFAULT_FORBIDDEN_PATHS
+from .evidence import write_evidence_receipts
 from .git_ops import git_branch, git_changed_files, git_diff, git_diff_stat, git_review_diff, git_status_short, parse_status_files, require_git
 from .learn import run_learn
 from .paths import cfc_path, current_file, ensure_cfc, root_path, runs_dir, wiki_dir
 from .prompts import render_check, render_precheck, render_task
+from .quality_gate import require_quality_gate, write_quality_gate
 from .state import active_run, current_active_run_or_none
 from .tmux_ops import send_tmux_prompt
 
@@ -67,6 +69,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     rid = f"{ts}-{slugify(title)}"
     rd = runs_dir(root) / rid
     config = load_config(root)
+    evidence_config = config.get("evidence", {}) if isinstance(config.get("evidence"), dict) else {}
     forbidden = list(config.get("defaults", {}).get("forbidden_paths", DEFAULT_FORBIDDEN_PATHS))
     forbidden.extend(args.forbid or [])
     status_before = git_status_short(root)
@@ -101,6 +104,10 @@ def cmd_start(args: argparse.Namespace) -> None:
             "forbidden_actions": config.get("defaults", {}).get("forbidden_actions", DEFAULT_FORBIDDEN_ACTIONS),
         },
         "verification": {"commands": args.verify or []},
+        "evidence": {
+            "dir": "evidence",
+            "require_receipts": bool(evidence_config.get("require_receipts", env_bool("CFC_REQUIRE_EVIDENCE_RECEIPTS", False))),
+        },
         "loop": {"max_iterations": int(getattr(args, "max_iterations", 0) or config.get("loop", {}).get("max_iterations") or os.environ.get("CFC_MAX_ITERATIONS", "3"))},
         "precheck": {"branch": git_branch(root), "status_short": status_before, "changed_files": baseline_files, "dirty": bool(baseline_files)},
         "check": {},
@@ -110,6 +117,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     (rd / "TASK.md").write_text(render_task(run), encoding="utf-8")
     (rd / "PRECHECK.md").write_text(render_precheck(run), encoding="utf-8")
     (rd / "PARKING_LOT.md").write_text("# Parking Lot\n\n", encoding="utf-8")
+    (rd / "evidence").mkdir(parents=True, exist_ok=True)
     append_ledger(rd, "preflight", "pass", branch=run["branch"], dirty=run["precheck"]["dirty"])
     print(f"Started CfC run: {rid}")
     print(f"Run dir: {rd}")
@@ -381,6 +389,12 @@ def cmd_done(args: argparse.Namespace) -> None:
             print(f"Wrote LEARN.md with {len(learn_candidates)} candidate(s); none auto-applied")
         else:
             print("Wrote LEARN.md; no strong learn candidates")
+    evidence_report = write_evidence_receipts(root, run, rd)
+    append_ledger(rd, "evidence_receipts", str(evidence_report.get("status", "unknown")).lower(), receipt_count=len(evidence_report.get("receipts", [])), blocker_count=len(evidence_report.get("blockers", [])))
+    gate = write_quality_gate(root=root, run=run, rd=rd, changed_files=changed, review_files=review_files, forced=args.force)
+    write_json(rd / "RUN.json", run)
+    append_ledger(rd, "quality_gate", str(gate.get("status", "unknown")).lower(), blocker_count=len(gate.get("blockers", [])))
+    require_quality_gate(gate)
     done = f"""# CfC Done: {run['title']}
 
 ## Verdict
@@ -398,6 +412,7 @@ def cmd_done(args: argparse.Namespace) -> None:
 - CHECK.md: {'present' if (rd / 'CHECK.md').exists() else 'missing'}
 - REVIEW.iteration-*.md: {'present' if review_files else 'missing'}
 - Classified review: {review.get('verdict', 'missing') if review else 'missing'}
+- QUALITY_GATE.json: {gate.get('status', 'missing')}
 - DIFF.md: {'present' if (rd / 'DIFF.md').exists() else 'missing'}
 - LEARN.md: {'present' if (rd / 'LEARN.md').exists() else 'missing'}
 
