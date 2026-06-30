@@ -1,6 +1,8 @@
 __pycache__/
 *.py[cod]
 .cfc/
+.omx/
+.idea/
 .DS_Store
 .pytest_cache/
 .coverage

@@ -1,3 +1,5 @@
+import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -5,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "cfc.py"
 
@@ -38,8 +41,41 @@ class CfCTest(unittest.TestCase):
         self.assertIn("**PASS**", res.stdout)
         res = run(["learn", "--root", str(root)])
         self.assertEqual(res.returncode, 0)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        review = rd / "REVIEW.iteration-1.md"
+        review.write_text("Verdict: PASS\n\n## BLOCKERS\n- none\n")
+        res = run(["classify-review", "--root", str(root), "--review-file", str(review)])
+        self.assertEqual(res.returncode, 0, res.stderr)
         res = run(["done", "--root", str(root)])
         self.assertEqual(res.returncode, 0, res.stderr)
+
+    def test_done_refuses_changed_run_without_independent_review(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Needs review", "--allow", "src/app.py"])
+        (root / "src" / "app.py").write_text("print('changed')\n")
+        res = run(["check", "--root", str(root)])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        res = run(["done", "--root", str(root)])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Independent review result missing", res.stderr)
+
+    def test_done_refuses_while_awaiting_external_agent(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Awaiting run", "--allow", "src/app.py"])
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        run_data = json.loads((rd / "RUN.json").read_text())
+        run_data["awaiting"] = {"phase": "reviewer", "target": "review:0.0"}
+        (rd / "RUN.json").write_text(json.dumps(run_data))
+        (rd / "CHECK.md").write_text("# check\n")
+        res = run(["done", "--root", str(root)])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("still awaiting external agent", res.stderr)
 
     def test_forbidden_file_fails_and_learn_applies(self):
         td, root = self.make_repo()
@@ -52,6 +88,61 @@ class CfCTest(unittest.TestCase):
         res = run(["learn", "--root", str(root), "--apply"])
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertTrue((root / ".cfc" / "wiki" / "guardrails" / "no-surprise-files-outside-task-scope.md").exists())
+
+    def test_root_done_md_is_forbidden_by_default(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "No root done", "--allow", "src/app.py"])
+        (root / "DONE.md").write_text("# DONE\n")
+        res = run(["check", "--root", str(root)])
+        self.assertIn("**FAIL**", res.stdout)
+        self.assertIn("DONE.md", res.stdout)
+        self.assertIn("repository report artifact created outside .cfc", res.stdout)
+
+    def test_nested_done_md_is_not_globally_forbidden(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Nested done allowed", "--allow", "src/**"])
+        (root / "src" / "DONE.md").write_text("# Legit nested doc\n")
+        res = run(["check", "--root", str(root)])
+        self.assertNotIn("repository report artifact created outside .cfc", res.stdout)
+        self.assertNotIn("forbidden files changed", res.stdout)
+
+    def test_start_refuses_preexisting_root_done_even_with_allow_dirty(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        (root / "DONE.md").write_text("# stale report\n")
+        res = run(["start", "--root", str(root), "Blocked by stale report", "--allow-dirty"])
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("repository report artifacts", res.stderr)
+        self.assertIn("DONE.md", res.stderr)
+
+    def test_done_auto_applies_high_severity_learn_and_next_prompt_loads_wiki(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Bad edit", "--allow", "src/app.py", "--forbid", "AGENTS.md"])
+        (root / "AGENTS.md").write_text("oops\n")
+        res = run(["check", "--root", str(root)])
+        self.assertIn("**FAIL**", res.stdout)
+        res = run(["done", "--root", str(root), "--force"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("Applied 1 high-confidence learn candidate", res.stdout)
+        wiki_page = root / ".cfc" / "wiki" / "guardrails" / "no-surprise-files-outside-task-scope.md"
+        self.assertTrue(wiki_page.exists())
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        self.assertIsNone(cur["run_id"])
+        res = run(["start", "--root", str(root), "Next prompt", "--allow-dirty", "--allow", "src/app.py"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        res = run(["gjc", "--root", str(root), "do it"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        prompt = (root / ".cfc" / "runs" / cur["run_id"] / "PROMPT.iteration-1.md").read_text()
+        self.assertIn("Applicable CfC Wiki Knowledge", prompt)
+        self.assertIn("No surprise files outside task scope", prompt)
 
     def test_prompt_includes_active_wiki(self):
         td, root = self.make_repo()
@@ -67,6 +158,12 @@ class CfCTest(unittest.TestCase):
         prompt = (root / ".cfc" / "runs" / cur["run_id"] / "PROMPT.iteration-1.md").read_text()
         self.assertIn("Preserve payload", prompt)
         self.assertIn("Keep payload stable", prompt)
+        self.assertIn("Pre-Edit Minimality Gate", prompt)
+        self.assertIn("Does the requested behavior already exist?", prompt)
+        self.assertIn("Can this be a one-line or tiny localized change?", prompt)
+        self.assertIn("Prefer deletion or wiring over addition", prompt)
+        self.assertIn("Do not create AGENTS.md, DONE.md", prompt)
+        self.assertIn("Report these items in the GJC chat/pane only", prompt)
 
     def test_dirty_start_refuses_without_allow_dirty(self):
         td, root = self.make_repo()
@@ -130,6 +227,28 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(parsed["verdict"], "REVIEW_BLOCKED")
         self.assertIn("review produced no output", parsed["blockers"])
 
+    def test_blocked_review_classification_generates_learn_and_applies_high_confidence_failure(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Reviewer incomplete"])
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        review = rd / "REVIEW.iteration-1.md"
+        review.write_text(
+            "Verdict: REVIEW_BLOCKED\n\n"
+            "## BLOCKERS\n"
+            "- Independent tmux reviewer did not produce a final verdict after repeated waits. CfC check passed, but independent review evidence is incomplete.\n"
+        )
+        res = run(["classify-review", "--root", str(root), "--review-file", str(review)])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue((rd / "LEARN.md").exists())
+        learn = (rd / "LEARN.md").read_text()
+        self.assertIn("Wait for reviewer verdict before classifying", learn)
+        wiki_page = root / ".cfc" / "wiki" / "failures" / "wait-for-reviewer-verdict-before-classifying.md"
+        self.assertTrue(wiki_page.exists())
+        self.assertIn("strict final `Verdict: PASS`", wiki_page.read_text())
+
     def test_review_blocked_without_bullets_still_blocks_done(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)
@@ -172,10 +291,15 @@ class CfCTest(unittest.TestCase):
         rd = root / ".cfc" / "runs" / cur["run_id"]
         review = rd / "REVIEW.iteration-1.md"
         review.write_text("Verdict: REVIEW_BLOCKED\n\n## BLOCKERS\n- verification missing\n")
+        run_data = json.loads((rd / "RUN.json").read_text())
+        run_data["awaiting"] = {"phase": "reviewer", "target": "review:0.0"}
+        (rd / "RUN.json").write_text(json.dumps(run_data))
         res = run(["classify-review", "--root", str(root), "--review-file", str(review)])
         self.assertEqual(res.returncode, 0, res.stderr)
         parsed = json.loads(res.stdout)
         self.assertEqual(parsed["verdict"], "REVIEW_BLOCKED")
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertNotIn("awaiting", run_after)
         self.assertEqual(parsed["blockers"], ["verification missing"])
         self.assertIn("verification missing", (rd / "BLOCKERS.md").read_text())
 
@@ -191,6 +315,9 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         prompt = (rd / "REPAIR_PROMPT.iteration-1.md").read_text()
         self.assertIn("fix syntax", prompt)
+        self.assertIn("Pre-Edit Minimality Gate", prompt)
+        self.assertIn("Before editing, repeat the Pre-Edit Minimality Gate specifically for each blocker", prompt)
+        self.assertIn("what is the smallest repair", prompt)
 
     def test_loop_with_command_agents_finishes_and_learns(self):
         td, root = self.make_repo()
@@ -216,31 +343,62 @@ class CfCTest(unittest.TestCase):
         self.assertTrue((rd / "DONE.md").exists())
         self.assertTrue((rd / "REVIEW.iteration-1.md").exists())
 
-    def test_no_args_opens_chat_mode(self):
-        res = subprocess.run([sys.executable, str(SCRIPT)], input="/exit\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    def test_no_args_prints_headless_plugin_help(self):
+        res = subprocess.run([sys.executable, str(SCRIPT)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("CfC / Crazy for Codex", res.stdout)
-        self.assertIn("recursive agent harness", res.stdout)
-        self.assertIn("❯", res.stdout)
+        self.assertIn("headless recursive agent controller", res.stdout)
+        self.assertIn("cfc plugin run", res.stdout)
+        self.assertNotIn("❯", res.stdout)
 
-    def test_active_run_chat_offers_replace_without_crashing(self):
+    def test_plugin_manifest_is_machine_readable(self):
+        res = run(["plugin", "manifest"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        manifest = json.loads(res.stdout)
+        self.assertEqual(manifest["name"], "cfc")
+        self.assertIn("run", manifest["commands"])
+        self.assertIn("status", manifest["commands"])
+
+    def test_plugin_status_reports_active_run_json(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)
         run(["init", "--root", str(root)])
         run(["start", "--root", str(root), "Existing"])
-        res = subprocess.run(
-            [sys.executable, str(SCRIPT), "chat", "--root", str(root)],
-            input="New task\nc\n/exit\n",
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        res = run(["plugin", "status", "--root", str(root)])
         self.assertEqual(res.returncode, 0, res.stderr)
-        self.assertIn("active run", res.stdout)
-        self.assertIn("Existing run", res.stdout)
-        self.assertIn("Cancelled. Nothing changed.", res.stdout)
+        payload = json.loads(res.stdout)
+        self.assertTrue(payload["is_git_repo"])
+        self.assertEqual(payload["active_run"]["title"], "Existing")
+        self.assertEqual(payload["active_run"]["status"], "active")
 
-    def test_replace_slash_command_supersedes_active_run(self):
+    def test_plugin_status_reports_nested_repos_for_workspace_root(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        workspace = Path(td.name)
+        app = workspace / "app"
+        app.mkdir()
+        subprocess.run(["git", "init"], cwd=app, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run(["plugin", "status", "--root", str(workspace)])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertFalse(payload["is_git_repo"])
+        self.assertEqual(payload["error"], "not_a_git_repository")
+        self.assertIn(str(app.resolve()), payload["nested_git_roots"])
+
+    def test_plugin_run_non_git_workspace_refuses_before_init(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        workspace = Path(td.name)
+        app = workspace / "app"
+        app.mkdir()
+        subprocess.run(["git", "init"], cwd=app, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run(["plugin", "run", "--root", str(workspace), "Do work", "--no-send"])
+        self.assertNotEqual(res.returncode, 0)
+        payload = json.loads(res.stderr)
+        self.assertEqual(payload["error"], "not_a_git_repository")
+        self.assertIn(str(app.resolve()), payload["nested_git_roots"])
+        self.assertFalse((workspace / ".cfc").exists())
+
+    def test_plugin_run_replace_supersedes_active_run(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)
         (root / "executor.py").write_text("import sys\nsys.stdin.read()\nprint('executor done')\n")
@@ -249,20 +407,16 @@ class CfCTest(unittest.TestCase):
         subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         run(["init", "--root", str(root)])
         run(["start", "--root", str(root), "Existing"])
-        env = dict(os.environ)
-        env["CFC_TMUX_WAIT_SECONDS"] = "0"
-        res = subprocess.run(
-            [sys.executable, str(SCRIPT), "chat", "--root", str(root)],
-            input=f"/replace New task\n/exit\n",
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-        )
-        # /replace reaches the loop without surfacing the old active-run error.
+        res = run([
+            "plugin", "run", "--root", str(root), "New task", "--replace",
+            "--executor-command", f"{sys.executable} executor.py",
+            "--reviewer-command", f"{sys.executable} reviewer.py",
+        ])
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("Started CfC run", res.stdout)
         self.assertNotIn("Active CfC run already exists", res.stdout)
+        payload = json.loads(res.stdout[res.stdout.rfind('\n{') + 1:])
+        self.assertIsNone(payload["active_run"])
 
     def test_loop_requires_reviewer_adapter(self):
         td, root = self.make_repo()
@@ -332,6 +486,200 @@ class CfCTest(unittest.TestCase):
         ])
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(counter.read_text().count("call"), 2)
+
+    def test_tmux_send_uses_stdin_buffer_to_avoid_arg_max(self):
+        spec = importlib.util.spec_from_file_location("cfc_module", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        long_prompt = "x" * 350000
+        with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+            module.tmux_send("target:0.0", long_prompt)
+
+        self.assertEqual(calls[0][0], ["tmux", "load-buffer", "-"])
+        self.assertEqual(calls[0][1]["input"], long_prompt)
+        self.assertTrue(calls[0][1]["text"])
+        self.assertNotIn(long_prompt, calls[0][0])
+        self.assertEqual(calls[1][0], ["tmux", "paste-buffer", "-t", "target:0.0"])
+        self.assertEqual(calls[2][0], ["tmux", "send-keys", "-t", "target:0.0", "Enter"])
+
+    def test_capture_waits_for_reviewer_verdict_and_classifies(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_capture", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Await reviewer", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False))
+        run_data, rd = module.active_run(root)
+        run_data["awaiting"] = {"phase": "reviewer", "iteration": 1, "target": "review:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        captures = [
+            subprocess.CompletedProcess(["tmux"], 0, "still working\n", ""),
+            subprocess.CompletedProcess(["tmux"], 0, "Verdict: PASS\n\n## BLOCKERS\n- none\n", ""),
+        ]
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=0, iteration=None)
+        with mock.patch.object(module, "tmux_capture", side_effect=captures), mock.patch.object(module.time, "sleep", return_value=None):
+            module.cmd_capture(ns)
+        self.assertTrue((rd / "REVIEW.iteration-1.md").exists())
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertNotIn("awaiting", run_after)
+        self.assertEqual(run_after["review"]["verdict"], "PASS")
+
+    def test_send_mode_without_wait_dispatches_once_before_check_review(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_send", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        sends = []
+
+        def fake_send(target, text):
+            sends.append((target, text))
+
+        ns = module.default_loop_namespace("Dispatch only", root=str(root), replace=False, allow_dirty=False)
+        ns.send = True
+        ns.tmux_wait_seconds = 0
+        ns.executor_command = None
+        ns.reviewer_command = None
+        ns.executor_target = "gjc:0.0"
+        ns.reviewer_target = "cfc-review:0.0"
+        ns.isolated_tmux = False
+        with mock.patch.object(module, "tmux_send", side_effect=fake_send):
+            module.cmd_loop(ns)
+
+        self.assertEqual(len(sends), 1)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_data.get("awaiting", {}).get("phase"), "executor")
+        self.assertFalse((rd / "CHECK.md").exists())
+        self.assertFalse(any(rd.glob("REVIEW_PROMPT.iteration-*.md")))
+        ledger = (rd / "ledger.jsonl").read_text()
+        self.assertIn("waiting_for_executor", ledger)
+
+    def test_isolated_tmux_creates_run_specific_targets_before_dispatch(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_isolated", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        sends = []
+        sessions = []
+
+        def fake_ensure(session, session_root, title):
+            sessions.append((session, session_root, title))
+            return f"{session}:0.0"
+
+        def fake_send(target, text):
+            sends.append((target, text))
+
+        ns = module.default_loop_namespace("Isolated dispatch", root=str(root), replace=False, allow_dirty=False)
+        ns.send = True
+        ns.tmux_wait_seconds = 0
+        ns.executor_command = None
+        ns.reviewer_command = None
+        ns.isolated_tmux = True
+        with mock.patch.object(module, "ensure_gjc_tmux_session", side_effect=fake_ensure), mock.patch.object(module, "tmux_send", side_effect=fake_send):
+            module.cmd_loop(ns)
+
+        self.assertEqual(len(sessions), 2)
+        self.assertTrue(sessions[0][0].startswith("cfc-"))
+        self.assertTrue(sessions[0][0].endswith("-exec"))
+        self.assertTrue(sessions[1][0].endswith("-review"))
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][0], f"{sessions[0][0]}:0.0")
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertTrue(run_data["runner"].get("isolated_tmux"))
+        self.assertEqual(run_data["runner"].get("target"), f"{sessions[0][0]}:0.0")
+        self.assertEqual(run_data["runner"].get("reviewer_target"), f"{sessions[1][0]}:0.0")
+
+    def test_review_without_required_verdict_is_blocked(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Missing verdict review"])
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        review = rd / "REVIEW.iteration-1.md"
+        review.write_text("## BLOCKERS\n- none\n\nLooks fine but no required final line.\n")
+        res = run(["classify-review", "--root", str(root), "--review-file", str(review)])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        parsed = json.loads(res.stdout)
+        self.assertEqual(parsed["verdict"], "REVIEW_BLOCKED")
+        self.assertIn("review missing required final Verdict line", parsed["blockers"])
+
+    def test_async_review_blocked_sends_blockers_back_to_executor_for_repair(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_async_blocked", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Async blocked", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False))
+        run_data, rd = module.active_run(root)
+        run_data.setdefault("runner", {})["target"] = "exec:0.0"
+        run_data["runner"]["reviewer_target"] = "review:0.0"
+        run_data["loop"] = {"max_iterations": 3}
+        run_data["awaiting"] = {"phase": "reviewer", "iteration": 1, "target": "review:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        review_text = "Verdict: REVIEW_BLOCKED\n\n## BLOCKERS\n- fix coupon total mismatch\n"
+        sends = []
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=0, iteration=None)
+        with mock.patch.object(module, "wait_for_tmux_verdict", return_value=review_text), mock.patch.object(module, "tmux_send", side_effect=lambda target, prompt: sends.append((target, prompt))):
+            module.cmd_capture(ns)
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][0], "exec:0.0")
+        self.assertIn("fix coupon total mismatch", sends[0][1])
+        self.assertTrue((rd / "REPAIR_PROMPT.iteration-1.md").exists())
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_after["awaiting"]["phase"], "executor")
+        self.assertEqual(run_after["awaiting"]["iteration"], 2)
+
+    def test_async_executor_capture_runs_check_and_sends_review(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_async_executor", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Async repair", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False))
+        run_data, rd = module.active_run(root)
+        run_data.setdefault("runner", {})["target"] = "exec:0.0"
+        run_data["runner"]["reviewer_target"] = "review:0.0"
+        run_data["awaiting"] = {"phase": "executor", "iteration": 2, "target": "exec:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        sends = []
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=0, iteration=None)
+        with mock.patch.object(module, "tmux_capture", return_value=subprocess.CompletedProcess(["tmux"], 0, "executor done\n", "")), mock.patch.object(module, "tmux_send", side_effect=lambda target, prompt: sends.append((target, prompt))):
+            module.cmd_capture(ns)
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(sends[0][0], "review:0.0")
+        self.assertIn("CfC Independent Review Prompt", sends[0][1])
+        self.assertTrue((rd / "CHECK.md").exists())
+        self.assertTrue((rd / "REVIEW_PROMPT.iteration-2.md").exists())
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_after["awaiting"]["phase"], "reviewer")
+        self.assertEqual(run_after["awaiting"]["iteration"], 2)
 
 
 if __name__ == "__main__":

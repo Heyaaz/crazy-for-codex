@@ -1,104 +1,166 @@
 # Crazy for Codex (CfC)
 
-CfC is a local-first recursive harness for GJC/Codex-style coding agents.
+CfC is a **headless, local-first recursive controller** for GJC/Codex/OMX-style coding agents.
 
-It keeps GJC as the worker and adds an external control/learning layer:
-
-- run records under `.cfc/runs/`
-- observable loop ledger (`ledger.jsonl`)
-- guarded GJC prompt generation and optional tmux injection
-- real git scope checks and verification command evidence
-- read-only review prompt generation and review-result classification
-- automatic `loop`: execute → check → clean review → repair → learn
-- LLM-Wiki-style learning candidates under `.cfc/wiki/`
-
-CfC does **not** mutate `.gjc/` state. `.gjc/` remains GJC runtime state; `.cfc/` is the external learning/control layer.
-
-## Conversational mode
-
-For daily use, run `cfc` with no subcommand:
-
-```bash
-cd /path/to/repo
-cfc
-```
-
-Then type naturally:
+It does not own a TUI. UI belongs to the host app/plugin; CfC owns the run ledger, guardrails, checks, review/repair loop, and learning artifacts.
 
 ```text
-cfc> README 정리해줘
-cfc> /status
-cfc> /exit
+Codex / OMX / GJC plugin UI
+  -> cfc plugin run/status/events/cancel
+  -> CfC controller
+  -> executor adapter + independent reviewer adapter
+  -> check / review / repair / learn
 ```
 
-You can also pass a request directly:
+CfC does **not** mutate `.gjc/` state. `.gjc/` remains GJC runtime state; `.cfc/` is the external control/learning layer.
+
+## Plugin surface
+
+Machine-readable manifest:
+
+```bash
+cfc plugin manifest
+```
+
+Run a task from a host plugin:
+
+```bash
+cfc plugin run "Fix small UI issue" \
+  --root /path/to/repo \
+  --allow 'src/Foo.tsx' \
+  --verify 'npm run lint' \
+  --executor-target gjc:0.0 \
+  --reviewer-target gjc:0.1
+```
+
+Status/events/cancel for host UIs:
+
+```bash
+cfc plugin status --root /path/to/repo
+cfc plugin events --root /path/to/repo
+cfc plugin cancel --root /path/to/repo
+```
+
+All plugin status outputs are JSON so Codex/OMX/GJC adapters can render their own UI.
+
+Workspace roots that are not git repositories are selector surfaces, not run targets. In that case `cfc plugin status --root <workspace>` returns `error: not_a_git_repository` plus `nested_git_roots`; adapters must choose one or more explicit nested repo roots and run CfC separately per repo. `cfc plugin run` refuses before creating `.cfc/` when the selected root is not a git repo.
+
+## Headless CLI defaults
+
+No-arg `cfc` prints help. It no longer opens a prompt/TUI.
+
+A bare request still works as a shorthand for plugin-style loop execution:
 
 ```bash
 cfc "README 정리해줘" --root /path/to/repo
 ```
 
+Default bare/plugin loop settings can be controlled by environment variables:
+
 ```text
-  CfC / Crazy for Codex                                                        v0.7.0
-──────────────────────────── recursive agent harness ────────────────────────────
-  repo   /path/to/repo
-  state  branch main · dirty clean · run none
-
-  Flow
-  1. shape task   → 2. GJC execute   → 3. clean review   → 4. repair loop   → 5. learn
-
-╭──────────────────────────────────────────────────────────────────────────────╮
-│ > Type your request... Enter: run loop · /help commands                     │
-╰──────────────────────────────────────────────────────────────────────────────╯
-⬢ CfC · controller / ⑂ main / 📁 /path/to/repo
-❯
+CFC_EXECUTOR_COMMAND
+CFC_REVIEWER_COMMAND
+CFC_EXECUTOR_TARGET       default: gjc:0.0
+CFC_REVIEWER_TARGET       default: cfc-review:0.0
+CFC_SEND                  default: 1
+CFC_TMUX_WAIT_SECONDS     default: 0
+CFC_MAX_ITERATIONS        default: 3
+CFC_APPLY_LEARN           default: 0
+CFC_ISOLATED_TMUX         default: 1
+CFC_REVIEW_POLL_SECONDS   default: 5
+CFC_REVIEW_WAIT_TIMEOUT_SECONDS default: 0 (wait indefinitely)
 ```
 
-If a run is already active, chat mode shows a compact active-run panel and lets you choose `replace`, `status`, `done`, or `cancel` instead of crashing with an argparse-style error.
+With the default tmux mode and `CFC_TMUX_WAIT_SECONDS=0`, CfC dispatches one step and returns with `RUN.json.awaiting` set. Resume the active run with `cfc capture --root <repo>` after the external agent finishes.
 
-By default, conversational requests run the recursive loop with:
+## Core loop
 
-- `allow: *`
-- `verify: git diff --check`
-- executor target: `$CFC_EXECUTOR_TARGET` or `gjc:0.0`
-- reviewer target: `$CFC_REVIEWER_TARGET` or `cfc-review:0.0`
+The loop requires an executor adapter and an independent reviewer adapter. Use either:
 
-## Quick start
+- tmux/GJC mode: `--send`, `--executor-target`, `--reviewer-target`
+- command mode: `--executor-command`, `--reviewer-command`
 
 ```bash
-python3 scripts/cfc.py init --root /path/to/repo
-
 python3 scripts/cfc.py loop --root /path/to/repo \
   "Fix small UI issue" \
   --allow 'src/Foo.tsx' \
   --verify 'npm run lint' \
-  --executor-target gjc:0.0 \
-  --reviewer-target gjc:0.1 \
-  --send \
-  --tmux-wait-seconds 120
+  --executor-command 'codex exec ...' \
+  --reviewer-command 'codex exec --readonly ...'
 ```
 
-The loop requires an executor adapter and an independent reviewer adapter. In tmux mode, pass `--send` with separate `--executor-target` / `--reviewer-target`. In non-interactive test/CI mode, pass `--executor-command` and `--reviewer-command`.
+Synchronous command-mode flow:
 
-The reviewer prompt includes `git status`, unstaged diff, staged diff, and small text untracked files so fresh review sees new files too.
+```text
+executor -> diff/check -> independent review -> classify -> repair if blocked -> learn -> done if clean
+```
 
-The loop creates a run, sends an executor prompt, checks the real diff and verification evidence, opens a fresh read-only reviewer prompt, classifies BLOCKER findings, sends a repair prompt when needed, repeats up to `--max-iterations`, then generates `LEARN.md` and `DONE.md` when clean.
+Async tmux/GJC flow:
 
-Manual primitives are also available:
+```text
+executor prompt sent
+  -> cfc capture
+  -> diff/check
+  -> reviewer prompt sent
+  -> cfc capture --wait-verdict
+  -> classify review
+  -> if PASS: ready for cfc done
+  -> if REVIEW_BLOCKED: send BLOCKERS back to executor as REPAIR_PROMPT
+  -> cfc capture
+  -> diff/check
+  -> review again
+```
+
+The reviewer must end with a strict final verdict line:
+
+```text
+Verdict: PASS
+```
+
+or:
+
+```text
+Verdict: REVIEW_BLOCKED
+```
+
+Missing or malformed verdict lines are treated as `REVIEW_BLOCKED`, never `PASS`.
+
+Reviewer evidence includes `git status`, unstaged diff, staged diff, small text untracked files, and `CHECK.md` verification evidence.
+
+## DONE.md ownership
+
+CfC owns final artifacts under:
+
+```text
+.cfc/runs/<run-id>/DONE.md
+```
+
+Workers must not create final reports in the repository root. A newly-created root-level `DONE.md` fails `cfc check`, and an existing dirty root-level `DONE.md` makes `cfc start` refuse even with `--allow-dirty`.
+
+Nested or legitimate project files named `DONE.md` are not globally forbidden. For example, `src/DONE.md` is allowed when it is inside the run's allowed paths.
+
+## Learning
+
+`done` and `learn` are separate concerns:
+
+```text
+PASS review -> LEARN.md -> high-confidence wiki entries -> DONE.md
+REVIEW_BLOCKED -> LEARN.md -> high-confidence process/system failures may still enter .cfc/wiki -> no DONE.md
+```
+
+This means blocked/failed runs can still preserve useful process lessons without falsely marking the task complete.
+
+## Manual primitives
 
 ```bash
-python3 scripts/cfc.py start --root /path/to/repo \
-  "Fix small UI issue" \
-  --allow 'src/Foo.tsx' \
-  --verify 'npm run lint'
-
-python3 scripts/cfc.py gjc --root /path/to/repo \
-  "Implement with minimal diff" \
-  --tmux-target gjc:0.0 \
-  --send
-
-python3 scripts/cfc.py capture --root /path/to/repo --tmux-target gjc:0.0
+python3 scripts/cfc.py init --root /path/to/repo
+python3 scripts/cfc.py start --root /path/to/repo "Fix small UI issue" --allow 'src/Foo.tsx' --verify 'npm run lint'
+python3 scripts/cfc.py gjc --root /path/to/repo "Implement with minimal diff" --tmux-target gjc:0.0 --send
+python3 scripts/cfc.py capture --root /path/to/repo
 python3 scripts/cfc.py check --root /path/to/repo
-python3 scripts/cfc.py review --root /path/to/repo --tmux-target gjc:0.0 --send
+python3 scripts/cfc.py review --root /path/to/repo --tmux-target gjc:0.1 --send
+python3 scripts/cfc.py classify-review --root /path/to/repo
+python3 scripts/cfc.py repair --root /path/to/repo --send
 python3 scripts/cfc.py learn --root /path/to/repo
 python3 scripts/cfc.py done --root /path/to/repo
 ```
@@ -110,21 +172,22 @@ If a run is already active, `cfc start` refuses by default. Use `--replace` only
 ## Commands
 
 ```text
-init      initialize .cfc state in a target repo
-start     start a guarded run
-status    show active run and recent ledger events
-gjc       generate guarded executor prompt, optionally send to tmux
-capture   capture GJC/tmux output into the run folder
-check     run git scope checks and verification commands
-diff      write DIFF.md from current git diff
-review    generate read-only independent review prompt
-classify-review parse REVIEW.iteration-N.md into BLOCKERS.md
-repair    generate/send repair-only prompt from current blockers
-loop      execute → check → fresh review → repair until blocker-free → learn
-park      add a note to PARKING_LOT.md
-learn     generate/apply LLM-Wiki-style learning candidates
-done      finalize a run after checks
-events    print ledger.jsonl events
+plugin          machine-readable adapter surface: manifest/run/status/events/cancel
+init            initialize .cfc state in a target repo
+start           start a guarded run
+status          show active run and recent ledger events
+gjc             generate guarded executor prompt, optionally send to tmux
+capture         capture GJC/tmux output; resumes awaiting executor/reviewer steps
+check           run git scope checks and verification commands
+diff            write DIFF.md from current git diff
+review          generate/send read-only independent review prompt
+classify-review parse REVIEW.iteration-N.md into BLOCKERS.md and LEARN.md
+repair          generate/send repair-only prompt from current blockers
+loop            execute -> check -> fresh review -> repair until blocker-free -> learn
+park            add a note to PARKING_LOT.md
+learn           generate/apply LLM-Wiki-style learning candidates
+done            finalize a run after checks and independent review
+events          print ledger.jsonl events
 ```
 
 ## Data model
@@ -139,14 +202,16 @@ events    print ledger.jsonl events
     PRECHECK.md
     PROMPT.iteration-1.md
     GJC_LOG.<time>.md
+    GJC_LOG.iteration-1.md
+    EXECUTION.iteration-1.md        # command-mode executor output
+    DIFF.md
+    CHECK.md
     REVIEW_PROMPT.iteration-1.md
     REVIEW.iteration-1.md
     BLOCKERS.md
     REPAIR_PROMPT.iteration-1.md
-    DIFF.md
-    CHECK.md
     LEARN.md
-    DONE.md
+    DONE.md                        # only when complete
     PARKING_LOT.md
     ledger.jsonl
   wiki/
@@ -159,24 +224,7 @@ events    print ledger.jsonl events
     checklists/*.md
 ```
 
-## Philosophy
-
-```text
-GJC = worker / executor / reviewer
-CfC = external run ledger + guardrails + checks + learning wiki
-```
-
-CfC grows by turning repeated blockers into local Markdown knowledge:
-
-```text
-run evidence -> LEARN.md -> wiki/failures + wiki/guardrails + wiki/runbooks -> future prompts/checks
-```
-
-Learning is suggestion-first. Use `learn --apply` only when you want CfC to write wiki entries.
-
 ## Development
-
-Run tests:
 
 ```bash
 python3 -m unittest discover -s tests -v
