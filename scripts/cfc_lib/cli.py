@@ -116,7 +116,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--wait-verdict", action="store_true", help="Wait until captured tmux output contains final Verdict: PASS/REVIEW_BLOCKED")
     sp.add_argument("--no-wait-verdict", action="store_true", help="Do not auto-wait even when awaiting reviewer")
     sp.add_argument("--poll-seconds", type=float, default=float(os.environ.get("CFC_REVIEW_POLL_SECONDS", "5")))
-    sp.add_argument("--timeout-seconds", type=int, default=int(os.environ.get("CFC_REVIEW_WAIT_TIMEOUT_SECONDS", "0")), help="0 means wait indefinitely")
+    sp.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=int(os.environ.get("CFC_REVIEW_WAIT_TIMEOUT_SECONDS", "300")),
+        help="Seconds to wait for a reviewer Verdict before writing REVIEW_BLOCKED; pass 0 to explicitly wait indefinitely",
+    )
     sp.add_argument("--iteration", type=int)
     sp.set_defaults(func=cmd_capture)
 

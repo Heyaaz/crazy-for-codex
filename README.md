@@ -110,10 +110,11 @@ CFC_MAX_ITERATIONS        default: 3
 CFC_APPLY_LEARN           default: 0
 CFC_ISOLATED_TMUX         default: 1
 CFC_REVIEW_POLL_SECONDS   default: 5
-CFC_REVIEW_WAIT_TIMEOUT_SECONDS default: 0 (wait indefinitely)
+CFC_REVIEW_WAIT_TIMEOUT_SECONDS default: 300 (pass 0 to wait indefinitely)
 ```
 
 With the default tmux mode and `CFC_TMUX_WAIT_SECONDS=0`, CfC dispatches one step and returns with `RUN.json.awaiting` set. Resume the active run with `cfc capture --root <repo>` after the external agent finishes.
+When capture is waiting for a reviewer verdict, it times out after 300 seconds by default and writes a blocked review artifact instead of waiting forever. Use `--timeout-seconds 0` only when you intentionally want an indefinite wait.
 
 ## Core loop
 

@@ -626,6 +626,17 @@ class CfCTest(unittest.TestCase):
         self.assertIn("cfc plugin run", res.stdout)
         self.assertNotIn("❯", res.stdout)
 
+    def test_capture_default_timeout_is_finite(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_capture_timeout_default", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            parser = module.build_parser()
+            args = parser.parse_args(["capture", "--root", "/tmp/repo"])
+        self.assertEqual(args.timeout_seconds, 300)
+
     def test_scripts_do_not_embed_private_absolute_paths(self):
         script_root = SCRIPT.parent
         files = [SCRIPT, *sorted((script_root / "cfc_lib").glob("*.py"))]
@@ -1212,6 +1223,9 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(run_data["status"], "send_failed")
         self.assertNotIn("awaiting", run_data)
         self.assertEqual(run_data["send_error"]["phase"], "execute_send")
+        ledger = (rd / "ledger.jsonl").read_text()
+        self.assertIn('"phase": "execute_send"', ledger)
+        self.assertIn('"status": "fail"', ledger)
 
     def test_short_run_token_uses_16_hex_digest(self):
         spec = importlib.util.spec_from_file_location("cfc_module_token", SCRIPT)
@@ -1308,6 +1322,35 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(run_after["awaiting"]["phase"], "executor")
         self.assertEqual(run_after["awaiting"]["iteration"], 2)
 
+    def test_async_review_blocked_honors_start_max_iterations(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_async_max_iterations", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Async max once", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False, max_iterations=1))
+        run_data, rd = module.active_run(root)
+        self.assertEqual(run_data["loop"]["max_iterations"], 1)
+        run_data.setdefault("runner", {})["target"] = "exec:0.0"
+        run_data["runner"]["reviewer_target"] = "review:0.0"
+        run_data["awaiting"] = {"phase": "reviewer", "iteration": 1, "target": "review:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        sends = []
+        ns = argparse.Namespace(root=str(root), tmux_target=None, lines=100, wait_verdict=False, no_wait_verdict=False, poll_seconds=0.01, timeout_seconds=300, iteration=None)
+        with mock.patch.object(module, "wait_for_tmux_verdict", return_value="Verdict: REVIEW_BLOCKED\n\n## BLOCKERS\n- stop here\n"), mock.patch.object(module, "tmux_send", side_effect=lambda target, prompt: sends.append((target, prompt))):
+            module.cmd_capture(ns)
+        self.assertEqual(sends, [])
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_after["status"], "review_blocked")
+        self.assertNotIn("awaiting", run_after)
+        ledger = (rd / "ledger.jsonl").read_text()
+        self.assertIn('"phase": "async_loop"', ledger)
+        self.assertIn('"status": "review_blocked"', ledger)
+        self.assertIn('"max_iterations": 1', ledger)
+
     def test_async_executor_capture_runs_check_and_sends_review(self):
         spec = importlib.util.spec_from_file_location("cfc_module_async_executor", SCRIPT)
         if spec is None or spec.loader is None:
@@ -1390,6 +1433,8 @@ class CfCTest(unittest.TestCase):
         run_after = json.loads((rd / "RUN.json").read_text())
         self.assertEqual(run_after["status"], "review_blocked")
         self.assertNotIn("awaiting", run_after)
+        self.assertEqual(run_after["review"]["verdict"], "REVIEW_BLOCKED")
+        self.assertIn("changed files outside allowed paths", "\n".join(run_after["review"]["blockers"]))
 
     def test_capture_does_not_overwrite_existing_review_iteration_file(self):
         spec = importlib.util.spec_from_file_location("cfc_module_review_no_clobber", SCRIPT)
