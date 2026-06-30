@@ -90,6 +90,8 @@ def external_terminal_command(root: Path, args: argparse.Namespace) -> str:
         parts.append("--replace")
     if getattr(args, "allow_dirty", False):
         parts.append("--allow-dirty")
+    if getattr(args, "budget", None):
+        parts.extend(["--budget", shlex.quote(str(args.budget))])
     max_iterations = getattr(args, "max_iterations", None)
     if max_iterations is not None:
         parts.extend(["--max-iterations", shlex.quote(str(max_iterations))])
@@ -99,6 +101,10 @@ def external_terminal_command(root: Path, args: argparse.Namespace) -> str:
         parts.extend(["--reviewer-profile", shlex.quote(str(args.reviewer_profile))])
     if getattr(args, "review_on_check_fail", True) is False:
         parts.append("--no-review-on-check-fail")
+    if getattr(args, "review_risk_gate", None) is True:
+        parts.append("--review-risk-gate")
+    elif getattr(args, "review_risk_gate", None) is False:
+        parts.append("--no-review-risk-gate")
     for value in getattr(args, "verify", []) or []:
         parts.extend(["--verify", shlex.quote(str(value))])
     for value in getattr(args, "allow", []) or []:

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .budget import budget_capture_lines, budget_name, budget_review_risk_gate, render_risk_gated_review, review_risk_gate_reason
 from .commands_core import cmd_check, cmd_diff, cmd_done, cmd_init, cmd_start
 from .common import append_ledger, env_bool, now_iso, sha256_text, write_json
 from .config import adapter_config, apply_configured_adapters, configured_executor_command, configured_executor_fallbacks, configured_reviewer_command, load_config
@@ -89,6 +90,41 @@ def write_execution_result(path: Path, attempt: dict[str, Any], res: subprocess.
         f"## stderr\n```text\n{res.stderr}\n```\n",
         encoding="utf-8",
     )
+
+def effective_capture_lines(args: argparse.Namespace, run: dict[str, Any] | None = None) -> int:
+    explicit = getattr(args, "lines", None)
+    if explicit is None:
+        explicit = getattr(args, "capture_lines", None)
+    if explicit is not None:
+        return max(1, int(explicit))
+    run_budget = None
+    if isinstance(run, dict) and isinstance(run.get("budget"), dict):
+        run_budget = run["budget"].get("name")
+    return budget_capture_lines(run_budget or getattr(args, "budget", None))
+
+def maybe_apply_review_risk_gate(root: Path, run: dict[str, Any], rd: Path, iteration: int) -> dict[str, Any] | None:
+    if not run.get("loop", {}).get("review_risk_gate"):
+        return None
+    reason = review_risk_gate_reason(root, run)
+    if not reason:
+        return None
+    review_text = render_risk_gated_review(reason, iteration)
+    review_path = next_available_path(rd / extract_review_result_name(iteration))
+    review_path.write_text(review_text, encoding="utf-8")
+    parsed = parse_review_result(review_text)
+    (rd / "BLOCKERS.md").write_text(render_blockers_md(review_path, parsed), encoding="utf-8")
+    run["review"] = {
+        "verdict": parsed["verdict"],
+        "blockers": parsed["blockers"],
+        "review_file": str(review_path),
+        "classified_at": now_iso(),
+        "risk_gated": True,
+        "reason": reason,
+    }
+    run.pop("awaiting", None)
+    write_json(rd / "RUN.json", run)
+    append_ledger(rd, "review_risk_gate", "skipped_reviewer", iteration=iteration, reason=reason, review_file=str(review_path))
+    return parsed
 
 def run_executor_command_attempts(args: argparse.Namespace, prompt: str, root: Path, rd: Path, run: dict[str, Any], iteration: int) -> None:
     attempts = executor_command_attempts(args)
@@ -169,6 +205,10 @@ def continue_after_executor_capture(root: Path, run: dict[str, Any], rd: Path, i
         append_ledger(rd, "async_loop", "check_failed_no_review", iteration=iteration, blocker_count=len(blockers))
         print("CfC check failed and review_on_check_fail is disabled. Inspect BLOCKERS.md.")
         return
+    gated = maybe_apply_review_risk_gate(root, run, rd, iteration)
+    if gated is not None:
+        print(f"CfC reviewer risk-gate skipped reviewer: {run['review']['reason']}")
+        return
     review_prompt = render_review_prompt(run, root, rd, iteration)
     review_prompt_path = rd / f"REVIEW_PROMPT.iteration-{iteration}.md"
     review_prompt_path.write_text(review_prompt, encoding="utf-8")
@@ -234,6 +274,7 @@ def cmd_capture(args: argparse.Namespace) -> None:
     is_awaiting_reviewer = awaiting.get("phase") == "reviewer"
     is_awaiting_executor = awaiting.get("phase") == "executor"
     target = args.tmux_target or awaiting.get("target") or run.get("runner", {}).get("target") or "gjc:0.0"
+    lines = effective_capture_lines(args, run)
     wait_for_verdict = args.wait_verdict or (is_awaiting_reviewer and not args.no_wait_verdict)
     if wait_for_verdict:
         if not args.timeout_seconds:
@@ -244,16 +285,16 @@ def cmd_capture(args: argparse.Namespace) -> None:
             print(f"cfc capture: --timeout-seconds 0 means waiting indefinitely for a final Verdict from {target}; interrupt manually if the reviewer hangs.")
         append_ledger(rd, "capture_wait", "start", target=target, timeout_seconds=args.timeout_seconds)
         try:
-            text = wait_for_tmux_verdict(target, args.lines, poll_seconds=args.poll_seconds, timeout_seconds=args.timeout_seconds)
+            text = wait_for_tmux_verdict(target, lines, poll_seconds=args.poll_seconds, timeout_seconds=args.timeout_seconds)
         except TimeoutError as e:
             append_ledger(rd, "capture_wait", "timeout", target=target, timeout_seconds=args.timeout_seconds)
             if not is_awaiting_reviewer:
                 raise SystemExit(str(e))
-            cap = tmux_capture(target, args.lines)
+            cap = tmux_capture(target, lines)
             captured_text = cap.stdout if cap.returncode == 0 else cap.stderr
             text = render_reviewer_timeout_result(target, args.timeout_seconds, captured_text)
     else:
-        p = tmux_capture(target, args.lines)
+        p = tmux_capture(target, lines)
         if p.returncode != 0:
             append_ledger(rd, "capture", "fail", target=target, error=p.stderr.strip())
             raise SystemExit(p.stderr.strip())
@@ -281,6 +322,12 @@ def cmd_capture(args: argparse.Namespace) -> None:
 
 def cmd_loop(args: argparse.Namespace) -> None:
     root = root_path(args)
+    config = load_config(root)
+    args.budget = budget_name(getattr(args, "budget", None), config)
+    if getattr(args, "capture_lines", None) is None:
+        args.capture_lines = budget_capture_lines(args.budget, config)
+    if getattr(args, "review_risk_gate", None) is None:
+        args.review_risk_gate = budget_review_risk_gate(args.budget, config)
     apply_configured_adapters(args, root)
     if not args.executor_command and not args.send:
         raise SystemExit("cfc loop requires an executor adapter: pass --executor-command or use --send with --executor-target")
@@ -292,7 +339,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
     start_args = argparse.Namespace(
         root=str(root), title=args.request, allow=args.allow, forbid=args.forbid, verify=args.verify,
         tmux_target=args.executor_target, allow_dirty=args.allow_dirty, replace=args.replace,
-        max_iterations=args.max_iterations,
+        max_iterations=args.max_iterations, budget=args.budget,
     )
     cmd_start(start_args)
     run, rd = active_run(root)
@@ -301,6 +348,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
         run, rd = active_run(root)
     run.setdefault("loop", {})["max_iterations"] = args.max_iterations
     run["loop"]["review_on_check_fail"] = bool(args.review_on_check_fail)
+    run["loop"]["review_risk_gate"] = bool(args.review_risk_gate)
     if args.send:
         run.setdefault("runner", {})["target"] = args.executor_target
         run["runner"]["reviewer_target"] = args.reviewer_target
@@ -348,46 +396,50 @@ def cmd_loop(args: argparse.Namespace) -> None:
         if run.get("check", {}).get("verdict") == "FAIL" and args.review_on_check_fail is False:
             final_parsed = {"verdict": "REVIEW_BLOCKED", "blockers": run.get("check", {}).get("failures", [])}
         else:
-            review_prompt = render_review_prompt(run, root, rd, iteration)
-            review_prompt_path = rd / f"REVIEW_PROMPT.iteration-{iteration}.md"
-            review_prompt_path.write_text(review_prompt, encoding="utf-8")
-            append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path))
-            if args.reviewer_command:
-                res = run_agent_command(args.reviewer_command, review_prompt, root, args.timeout)
-                if res.returncode != 0:
-                    review_text = (
-                        "Verdict: REVIEW_BLOCKED\n\n## BLOCKERS\n"
-                        f"- reviewer command failed with exit {res.returncode}; review evidence is invalid\n\n"
-                        "## reviewer stdout\n```text\n" + res.stdout + "\n```\n\n"
-                        "## reviewer stderr\n```text\n" + res.stderr + "\n```\n"
+            gated = maybe_apply_review_risk_gate(root, run, rd, iteration)
+            if gated is not None:
+                final_parsed = gated
+            else:
+                review_prompt = render_review_prompt(run, root, rd, iteration)
+                review_prompt_path = rd / f"REVIEW_PROMPT.iteration-{iteration}.md"
+                review_prompt_path.write_text(review_prompt, encoding="utf-8")
+                append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path))
+                if args.reviewer_command:
+                    res = run_agent_command(args.reviewer_command, review_prompt, root, args.timeout)
+                    if res.returncode != 0:
+                        review_text = (
+                            "Verdict: REVIEW_BLOCKED\n\n## BLOCKERS\n"
+                            f"- reviewer command failed with exit {res.returncode}; review evidence is invalid\n\n"
+                            "## reviewer stdout\n```text\n" + res.stdout + "\n```\n\n"
+                            "## reviewer stderr\n```text\n" + res.stderr + "\n```\n"
+                        )
+                    else:
+                        review_text = res.stdout + ("\n\n## reviewer stderr\n```text\n" + res.stderr + "\n```\n" if res.stderr else "")
+                    append_ledger(rd, "review_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode)
+                elif args.send:
+                    send_tmux_prompt(run, rd, "review_send", args.reviewer_target, review_prompt, iteration=iteration)
+                    if not args.tmux_wait_seconds:
+                        run["awaiting"] = {"phase": "reviewer", "iteration": iteration, "target": args.reviewer_target, "prompt": str(review_prompt_path), "since": now_iso()}
+                        write_json(rd / "RUN.json", run)
+                        append_ledger(rd, "loop", "waiting_for_reviewer", iteration=iteration, target=args.reviewer_target)
+                        print(f"CfC dispatched reviewer prompt to {args.reviewer_target} and is waiting for external completion before classification.")
+                        print(f"Run dir: {rd}")
+                        return
+                    review_text = wait_for_tmux_verdict(
+                        args.reviewer_target,
+                        args.capture_lines,
+                        poll_seconds=float(os.environ.get("CFC_REVIEW_POLL_SECONDS", "5")),
+                        timeout_seconds=int(os.environ.get("CFC_REVIEW_WAIT_TIMEOUT_SECONDS", str(args.tmux_wait_seconds or 0))),
                     )
                 else:
-                    review_text = res.stdout + ("\n\n## reviewer stderr\n```text\n" + res.stderr + "\n```\n" if res.stderr else "")
-                append_ledger(rd, "review_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode)
-            elif args.send:
-                send_tmux_prompt(run, rd, "review_send", args.reviewer_target, review_prompt, iteration=iteration)
-                if not args.tmux_wait_seconds:
-                    run["awaiting"] = {"phase": "reviewer", "iteration": iteration, "target": args.reviewer_target, "prompt": str(review_prompt_path), "since": now_iso()}
-                    write_json(rd / "RUN.json", run)
-                    append_ledger(rd, "loop", "waiting_for_reviewer", iteration=iteration, target=args.reviewer_target)
-                    print(f"CfC dispatched reviewer prompt to {args.reviewer_target} and is waiting for external completion before classification.")
-                    print(f"Run dir: {rd}")
-                    return
-                review_text = wait_for_tmux_verdict(
-                    args.reviewer_target,
-                    args.capture_lines,
-                    poll_seconds=float(os.environ.get("CFC_REVIEW_POLL_SECONDS", "5")),
-                    timeout_seconds=int(os.environ.get("CFC_REVIEW_WAIT_TIMEOUT_SECONDS", str(args.tmux_wait_seconds or 0))),
-                )
-            else:
-                raise SystemExit("cfc loop requires an independent reviewer: pass --reviewer-command or use --send with --reviewer-target")
-            review_path = rd / extract_review_result_name(iteration)
-            review_path.write_text(review_text, encoding="utf-8")
-            final_parsed = parse_review_result(review_text)
-            (rd / "BLOCKERS.md").write_text(render_blockers_md(review_path, final_parsed), encoding="utf-8")
-            run["review"] = {"verdict": final_parsed["verdict"], "blockers": final_parsed["blockers"], "review_file": str(review_path), "classified_at": now_iso()}
-            write_json(rd / "RUN.json", run)
-            append_ledger(rd, "review_classify", final_parsed["verdict"].lower(), iteration=iteration, blocker_count=len(final_parsed["blockers"]))
+                    raise SystemExit("cfc loop requires an independent reviewer: pass --reviewer-command or use --send with --reviewer-target")
+                review_path = rd / extract_review_result_name(iteration)
+                review_path.write_text(review_text, encoding="utf-8")
+                final_parsed = parse_review_result(review_text)
+                (rd / "BLOCKERS.md").write_text(render_blockers_md(review_path, final_parsed), encoding="utf-8")
+                run["review"] = {"verdict": final_parsed["verdict"], "blockers": final_parsed["blockers"], "review_file": str(review_path), "classified_at": now_iso()}
+                write_json(rd / "RUN.json", run)
+                append_ledger(rd, "review_classify", final_parsed["verdict"].lower(), iteration=iteration, blocker_count=len(final_parsed["blockers"]))
         blockers = final_parsed.get("blockers", [])
         if not blockers and run.get("check", {}).get("verdict") != "FAIL":
             append_ledger(rd, "loop", "pass", iteration=iteration)
@@ -417,10 +469,12 @@ def cmd_loop(args: argparse.Namespace) -> None:
         cmd_learn(argparse.Namespace(root=str(root), apply=args.apply_learn))
         print("CfC loop ended review_blocked/failed. Inspect BLOCKERS.md and run artifacts.")
 
-def default_loop_namespace(request: str, root: str = ".", replace: bool = False, allow_dirty: bool = False) -> argparse.Namespace:
+def default_loop_namespace(request: str, root: str = ".", replace: bool = False, allow_dirty: bool = False, budget: str | None = None) -> argparse.Namespace:
     root_path_value = nearest_git_root(Path(root))
     config = load_config(root_path_value if is_git_repo(root_path_value) else Path(root))
     adapters = adapter_config(config)
+    selected_budget = budget_name(budget, config)
+    configured_capture_lines = adapters.get("capture_lines") or adapters.get("captureLines")
     mode = str(adapters.get("mode") or "tmux")
     executor_command, executor_profile = configured_executor_command(config, request)
     executor_fallbacks = configured_executor_fallbacks(config, executor_profile)
@@ -437,7 +491,7 @@ def default_loop_namespace(request: str, root: str = ".", replace: bool = False,
         reviewer_target=str(adapters.get("reviewer_target") or adapters.get("reviewerTarget") or os.environ.get("CFC_REVIEWER_TARGET", "cfc-review:0.0")),
         send=False if command_mode else env_bool("CFC_SEND", True),
         tmux_wait_seconds=int(adapters.get("tmux_wait_seconds") or adapters.get("tmuxWaitSeconds") or os.environ.get("CFC_TMUX_WAIT_SECONDS", "0")),
-        capture_lines=int(adapters.get("capture_lines") or adapters.get("captureLines") or os.environ.get("CFC_CAPTURE_LINES", "5000")),
+        capture_lines=int(configured_capture_lines) if configured_capture_lines else budget_capture_lines(selected_budget, config),
         isolated_tmux=bool(adapters.get("isolated_tmux", adapters.get("isolatedTmux", env_bool("CFC_ISOLATED_TMUX", True)))),
         executor_command=executor_command or os.environ.get("CFC_EXECUTOR_COMMAND") or None,
         executor_fallbacks=executor_fallbacks,
@@ -449,4 +503,6 @@ def default_loop_namespace(request: str, root: str = ".", replace: bool = False,
         replace=replace,
         apply_learn=env_bool("CFC_APPLY_LEARN", False),
         review_on_check_fail=env_bool("CFC_REVIEW_ON_CHECK_FAIL", True),
+        review_risk_gate=budget_review_risk_gate(selected_budget, config),
+        budget=selected_budget,
     )

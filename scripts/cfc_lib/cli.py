@@ -51,6 +51,7 @@ def run_bare_request(argv: list[str]) -> int:
     root = "."
     replace = False
     allow_dirty = False
+    budget = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -66,6 +67,10 @@ def run_bare_request(argv: list[str]) -> int:
             allow_dirty = True
             i += 1
             continue
+        if arg == "--budget" and i + 1 < len(argv):
+            budget = argv[i + 1]
+            i += 2
+            continue
         request_parts.append(arg)
         i += 1
     root_path_value = str(nearest_git_root(Path(root)))
@@ -73,7 +78,7 @@ def run_bare_request(argv: list[str]) -> int:
     if not request:
         print_headless_help()
         return 0
-    cmd_loop(default_loop_namespace(request, root=root_path_value, replace=replace, allow_dirty=allow_dirty))
+    cmd_loop(default_loop_namespace(request, root=root_path_value, replace=replace, allow_dirty=allow_dirty, budget=budget))
     return 0
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,12 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
     def add_root(sp: argparse.ArgumentParser) -> None:
         sp.add_argument("--root", default=".", help="Target repository root")
 
+    def add_budget(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--budget", choices=["light", "normal", "strict"], help="Token/context budget preset")
+
     sp = sub.add_parser("init")
     add_root(sp)
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("start")
     add_root(sp)
+    add_budget(sp)
     sp.add_argument("title")
     sp.add_argument("--allow", action="append")
     sp.add_argument("--forbid", action="append")
@@ -115,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("capture")
     add_root(sp)
     sp.add_argument("--tmux-target")
-    sp.add_argument("--lines", type=int, default=5000)
+    sp.add_argument("--lines", type=int, default=None)
     sp.add_argument("--wait-verdict", action="store_true", help="Wait until captured tmux output contains final Verdict: PASS/REVIEW_BLOCKED")
     sp.add_argument("--no-wait-verdict", action="store_true", help="Do not auto-wait even when awaiting reviewer")
     sp.add_argument("--poll-seconds", type=float, default=float(os.environ.get("CFC_REVIEW_POLL_SECONDS", "5")))
@@ -158,6 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("loop")
     add_root(sp)
+    add_budget(sp)
     sp.add_argument("request")
     sp.add_argument("--allow", action="append")
     sp.add_argument("--forbid", action="append")
@@ -167,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--reviewer-target", default="gjc:0.1")
     sp.add_argument("--send", action="store_true")
     sp.add_argument("--tmux-wait-seconds", type=int, default=0)
-    sp.add_argument("--capture-lines", type=int, default=5000)
+    sp.add_argument("--capture-lines", type=int, default=None)
     sp.add_argument("--isolated-tmux", action="store_true", help="Create dedicated executor/reviewer GJC tmux sessions for this run")
     sp.add_argument("--executor-profile")
     sp.add_argument("--reviewer-profile")
@@ -180,6 +190,9 @@ def build_parser() -> argparse.ArgumentParser:
     review_fail = sp.add_mutually_exclusive_group()
     review_fail.add_argument("--review-on-check-fail", dest="review_on_check_fail", action="store_true", default=True)
     review_fail.add_argument("--no-review-on-check-fail", dest="review_on_check_fail", action="store_false")
+    review_gate = sp.add_mutually_exclusive_group()
+    review_gate.add_argument("--review-risk-gate", dest="review_risk_gate", action="store_true", default=None, help="Skip reviewer for CHECK PASS low-risk/no-diff runs")
+    review_gate.add_argument("--no-review-risk-gate", dest="review_risk_gate", action="store_false", help="Always call the reviewer adapter")
     sp.set_defaults(func=cmd_loop)
 
     sp = sub.add_parser("park")
@@ -220,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = plugin_sub.add_parser("run")
     add_root(sp)
+    add_budget(sp)
     sp.add_argument("request")
     sp.add_argument("--allow", action="append")
     sp.add_argument("--forbid", action="append")
@@ -236,6 +250,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--allow-dirty", action="store_true")
     sp.add_argument("--replace", action="store_true")
     sp.add_argument("--no-review-on-check-fail", action="store_true")
+    review_gate = sp.add_mutually_exclusive_group()
+    review_gate.add_argument("--review-risk-gate", dest="review_risk_gate", action="store_true", default=None)
+    review_gate.add_argument("--no-review-risk-gate", dest="review_risk_gate", action="store_false")
     sp.add_argument("--handoff-only", action="store_true", help="Print external-terminal handoff JSON without starting a run")
     sp.set_defaults(func=cmd_plugin_run)
 

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .budget import budget_name, resolve_budget
 from .common import append_ledger, env_bool, match_any, now_iso, sha256_text, shell_cmd, slugify, write_json
 from .config import load_config
 from .constants import DEFAULT_FORBIDDEN_ACTIONS, DEFAULT_FORBIDDEN_PATHS
@@ -69,6 +70,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     rid = f"{ts}-{slugify(title)}"
     rd = runs_dir(root) / rid
     config = load_config(root)
+    selected_budget = budget_name(getattr(args, "budget", None), config)
     evidence_config = config.get("evidence", {}) if isinstance(config.get("evidence"), dict) else {}
     forbidden = list(config.get("defaults", {}).get("forbidden_paths", DEFAULT_FORBIDDEN_PATHS))
     forbidden.extend(args.forbid or [])
@@ -108,6 +110,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             "dir": "evidence",
             "require_receipts": bool(evidence_config.get("require_receipts", env_bool("CFC_REQUIRE_EVIDENCE_RECEIPTS", False))),
         },
+        "budget": {"name": selected_budget, "preset": resolve_budget(selected_budget, config)},
         "loop": {"max_iterations": int(getattr(args, "max_iterations", 0) or config.get("loop", {}).get("max_iterations") or os.environ.get("CFC_MAX_ITERATIONS", "3"))},
         "precheck": {"branch": git_branch(root), "status_short": status_before, "changed_files": baseline_files, "dirty": bool(baseline_files)},
         "check": {},

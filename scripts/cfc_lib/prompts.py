@@ -18,6 +18,8 @@ from .common import now_iso, sha256_text, write_json
 from .git_ops import git_diff_stat, git_review_diff
 from .paths import runs_dir
 from .state import collect_active_wiki
+from .budget import resolve_budget
+from .constants import BUDGET_PRESETS, DEFAULT_BUDGET
 
 def format_list(items: list[str]) -> str:
     if not items:
@@ -169,13 +171,19 @@ def wiki_context_char_budget(run: dict[str, Any], user_request: str) -> int:
         try:
             return max(0, int(explicit))
         except ValueError:
-            return 6000
+            return BUDGET_PRESETS[DEFAULT_BUDGET]["wiki_chars"]
+    # Budget preset (from run['budget']['name'] or CFC_BUDGET) selects the
+    # conservative default char allowance; large prompt pressure still tightens
+    # it further so we never blow the agent's context window on wiki memory.
+    budget_name = (run.get("budget") or {}).get("name") if isinstance(run.get("budget"), dict) else None
+    preset = resolve_budget(budget_name)
+    default_chars = int(preset["wiki_chars"])
     prompt_pressure = len(str(run.get("title") or "")) + len(user_request) + len(json.dumps(run.get("guardrails", {}), ensure_ascii=False))
     if prompt_pressure > 24000:
-        return 1500
+        return min(default_chars, 1500)
     if prompt_pressure > 12000:
-        return 3000
-    return 6000
+        return min(default_chars, 1800)
+    return default_chars
 
 
 def budget_wiki_context(
@@ -295,7 +303,14 @@ def build_prompt(run: dict[str, Any], root: Path, user_request: str, mode: str =
                 )
                 sections.append(f"<!-- CFC:WIKI-SOURCE {source_id} END -->")
     sections.append("## Required Final Report")
-    sections.append("Report these items in the GJC chat/pane only; do not create or edit `DONE.md` or any report file in the repository.\n\n1. Files changed\n2. Why each file changed\n3. Verification commands and exact result\n4. Remaining risks/blockers\n5. Whether done criteria are met")
+    sections.append(
+        "Report in the GJC chat/pane only (no `DONE.md`/report files). At most 5 evidence-focused lines:\n"
+        "1. Files changed\n"
+        "2. Why each file changed (one line)\n"
+        "3. Verification command + exact result\n"
+        "4. Remaining risks/blockers (or `none`)\n"
+        "5. `DONE:` or `NOT DONE:` + one-sentence reason"
+    )
     sections.append("## User Request")
     sections.append(user_request)
     return "\n\n".join(sections).strip() + "\n"
@@ -386,6 +401,42 @@ Verdict: PASS or REVIEW_BLOCKED
 
 def render_repair_prompt(run: dict[str, Any], root: Path, rd: Path, iteration: int, blockers: list[str]) -> str:
     blocker_text = "\n".join(f"- {b}" for b in blockers) or "- none"
+    delta_only = iteration > 1
+    if delta_only:
+        # After the first repair, the executor already has the full task contract
+        # in transcript; sending it again just burns context. Give only the delta:
+        # the blockers, the current diff, and a compact final-report contract.
+        return f"""# CfC Repair Prompt (delta only)
+
+Repository: {root}
+Run: {run['title']} ({run['id']})
+Repair iteration: {iteration}
+
+Delta-only repair: do not re-read the full task contract or restage context already in your transcript. Fix only the BLOCKERS below against the current diff.
+Before editing, repeat the Pre-Edit Minimality Gate specifically for each blocker: is it truly a blocker, does existing code already satisfy it, and what is the smallest repair?
+Do not broaden scope, refactor unrelated code, install dependencies, stage, commit, or push.
+After the repair, run the configured verification commands and report exact results.
+When you change files or run verification, write concise evidence under `.cfc/runs/{run['id']}/evidence/` and include `CFC_EVIDENCE_RECORDED: <path>` in the final report.
+
+{render_minimality_gate()}
+
+## BLOCKERS to fix
+
+{blocker_text}
+
+## Current Diff (delta)
+
+{git_review_diff(root)}
+
+## Required final report
+
+Report in the GJC chat/pane only; do not create or edit `DONE.md` or any report file in the repository.
+
+1. Files changed
+2. Which BLOCKER each change fixes
+3. Verification commands and exact result
+4. Remaining risks/blockers
+"""
     return f"""# CfC Repair Prompt
 
 Repository: {root}

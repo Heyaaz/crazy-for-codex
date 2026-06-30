@@ -99,6 +99,7 @@ def cmd_plugin_manifest(args: argparse.Namespace) -> None:
             "CFC_SEND", "CFC_TMUX_WAIT_SECONDS", "CFC_MAX_ITERATIONS", "CFC_APPLY_LEARN", "CFC_ISOLATED_TMUX",
             "CFC_DONE_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_ON_CHECK_FAIL",
             "CFC_REVIEW_POLL_SECONDS", "CFC_REVIEW_WAIT_TIMEOUT_SECONDS", "CFC_ALLOW_SANDBOX_LIVE_ADAPTERS",
+            "CFC_BUDGET", "CFC_CAPTURE_LINES", "CFC_WIKI_CONTEXT_MAX_CHARS", "CFC_REVIEW_RISK_GATE",
         ],
     }
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
@@ -136,7 +137,7 @@ def cmd_plugin_cancel(args: argparse.Namespace) -> None:
 def cmd_plugin_run(args: argparse.Namespace) -> None:
     root_path_value = resolve_plugin_root(args)
     root = str(root_path_value)
-    ns = default_loop_namespace(args.request, root=root, replace=args.replace, allow_dirty=args.allow_dirty)
+    ns = default_loop_namespace(args.request, root=root, replace=args.replace, allow_dirty=args.allow_dirty, budget=getattr(args, "budget", None))
     if getattr(args, "executor_profile", None):
         ns.executor_profile = args.executor_profile
         ns.executor_command = None
@@ -166,15 +167,21 @@ def cmd_plugin_run(args: argparse.Namespace) -> None:
         ns.max_iterations = args.max_iterations
     if getattr(args, "no_review_on_check_fail", False):
         ns.review_on_check_fail = False
+    if getattr(args, "review_risk_gate", None) is not None:
+        ns.review_risk_gate = args.review_risk_gate
     if args.verify:
         ns.verify = args.verify
     if args.allow:
         ns.allow = args.allow
     if args.forbid:
         ns.forbid = args.forbid
+    payload = external_terminal_handoff_payload(root_path_value, ns)
     if getattr(args, "handoff_only", False):
-        payload = external_terminal_handoff_payload(root_path_value, ns)
         payload["status"] = "handoff_only"
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    if payload.get("handoff_required"):
+        payload["status"] = "handoff_required"
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     cmd_loop(ns)

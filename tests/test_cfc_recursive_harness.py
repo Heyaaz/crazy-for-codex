@@ -283,7 +283,7 @@ class CfCTest(unittest.TestCase):
         self.assertIn("Can this be a one-line or tiny localized change?", prompt)
         self.assertIn("Prefer deletion or wiring over addition", prompt)
         self.assertIn("Do not create AGENTS.md, DONE.md", prompt)
-        self.assertIn("Report these items in the GJC chat/pane only", prompt)
+        self.assertIn("At most 5 evidence-focused lines", prompt)
 
     def test_prompt_prefers_task_tag_matching_wiki(self):
         td, root = self.make_repo()
@@ -786,6 +786,26 @@ class CfCTest(unittest.TestCase):
             args = parser.parse_args(["capture", "--root", "/tmp/repo"])
         self.assertEqual(args.timeout_seconds, 300)
 
+    def test_capture_default_lines_use_budget_preset(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_capture_lines_default", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            parser = module.build_parser()
+            args = parser.parse_args(["capture", "--root", "/tmp/repo"])
+            self.assertIsNone(args.lines)
+            self.assertEqual(module.effective_capture_lines(args), 1000)
+        with mock.patch.dict(os.environ, {"CFC_BUDGET": "strict"}, clear=True):
+            parser = module.build_parser()
+            args = parser.parse_args(["capture", "--root", "/tmp/repo"])
+            self.assertEqual(module.effective_capture_lines(args), 5000)
+        with mock.patch.dict(os.environ, {"CFC_CAPTURE_LINES": "123"}, clear=True):
+            parser = module.build_parser()
+            args = parser.parse_args(["capture", "--root", "/tmp/repo"])
+            self.assertEqual(module.effective_capture_lines(args), 123)
+
     def test_scripts_do_not_embed_private_absolute_paths(self):
         script_root = SCRIPT.parent
         files = [SCRIPT, *sorted((script_root / "cfc_lib").glob("*.py"))]
@@ -1263,12 +1283,17 @@ class CfCTest(unittest.TestCase):
         env["CODEX_SANDBOX"] = "seatbelt"
         env.pop("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS", None)
         res = run(["plugin", "run", "--root", str(root), "Sandbox live adapter"], env=env)
-        self.assertNotEqual(res.returncode, 0)
-        self.assertIn("CfC live command adapters are disabled inside the Codex App sandbox", res.stderr)
-        self.assertIn("external terminal", res.stderr)
-        self.assertIn("gjc -p --model opencode-go/glm-5.2", res.stderr)
-        self.assertIn("codex exec --sandbox read-only", res.stderr)
-        self.assertIn("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS=1", res.stderr)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["status"], "handoff_required")
+        self.assertTrue(payload["handoff_required"])
+        self.assertEqual(payload["reason"], "codex_app_sandbox_live_adapters")
+        self.assertIn("cfc plugin run", payload["external_command"])
+        self.assertIn("--executor-profile glm", payload["external_command"])
+        self.assertIn("--reviewer-profile codex", payload["external_command"])
+        attempts = json.dumps(payload["live_adapter_attempts"])
+        self.assertIn("gjc -p --model opencode-go/glm-5.2", attempts)
+        self.assertIn("codex exec --sandbox read-only", attempts)
         self.assertFalse((root / ".cfc").exists())
 
     def test_local_command_profiles_still_run_inside_codex_sandbox(self):
@@ -1436,6 +1461,7 @@ class CfCTest(unittest.TestCase):
         subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         res = run([
             "loop", "--root", str(root), "Read-only audit",
+            "--budget", "strict",
             "--verify", "git diff --check",
             "--executor-command", f"{sys.executable} executor.py",
             "--reviewer-command", f"{sys.executable} reviewer.py",
@@ -1448,6 +1474,87 @@ class CfCTest(unittest.TestCase):
         self.assertIn("Do not inspect the repository", prompt)
         self.assertIn("run tests, or run verification commands", prompt)
         self.assertIn("Executor Report Excerpt", prompt)
+
+    def test_default_budget_skips_reviewer_for_no_diff_pass(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        marker = root / "reviewer-called.txt"
+        (root / "executor.py").write_text("import sys\nsys.stdin.read()\nprint('read-only audit done')\n")
+        (root / "reviewer.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(marker)!r}).write_text('called\\n')\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run([
+            "loop", "--root", str(root), "No diff skip",
+            "--verify", "git diff --check",
+            "--executor-command", f"{sys.executable} executor.py",
+            "--reviewer-command", f"{sys.executable} reviewer.py",
+        ])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse(marker.exists())
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["last_run_id"]
+        review = (rd / "REVIEW.iteration-1.md").read_text()
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertIn("Reviewer adapter skipped", review)
+        self.assertTrue(run_data["review"]["risk_gated"])
+        self.assertEqual(run_data["budget"]["name"], "normal")
+        self.assertFalse((rd / "REVIEW_PROMPT.iteration-1.md").exists())
+        self.assertTrue((rd / "DONE.md").exists())
+
+    def test_strict_budget_keeps_reviewer_for_no_diff_pass(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        marker = root / "reviewer-called.txt"
+        (root / "executor.py").write_text("import sys\nsys.stdin.read()\nprint('read-only audit done')\n")
+        (root / "reviewer.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(marker)!r}).write_text('called\\n')\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run([
+            "loop", "--root", str(root), "No diff strict",
+            "--budget", "strict",
+            "--verify", "git diff --check",
+            "--executor-command", f"{sys.executable} executor.py",
+            "--reviewer-command", f"{sys.executable} reviewer.py",
+        ])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(marker.exists())
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["last_run_id"]
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_data["budget"]["name"], "strict")
+        self.assertNotIn("risk_gated", run_data["review"])
+        self.assertTrue((rd / "REVIEW_PROMPT.iteration-1.md").exists())
+
+    def test_low_risk_changes_skip_reviewer_under_normal_budget(self):
+        cases = [
+            ("docs-only", "import pathlib, sys\nsys.stdin.read()\npathlib.Path('README.md').write_text('hello docs\\n')\n", ["README.md"]),
+            ("test-only", "import pathlib, sys\nsys.stdin.read()\np=pathlib.Path('tests/test_new.py'); p.parent.mkdir(exist_ok=True); p.write_text('def test_ok():\\n    assert True\\n')\n", ["tests/**"]),
+            ("tiny-config", "import pathlib, sys\nsys.stdin.read()\npathlib.Path('settings.json').write_text('{\"enabled\": true}\\n')\n", ["settings.json"]),
+        ]
+        for name, executor_body, allowed in cases:
+            with self.subTest(name=name):
+                td, root = self.make_repo()
+                self.addCleanup(td.cleanup)
+                marker = root / "reviewer-called.txt"
+                (root / "executor.py").write_text(executor_body)
+                (root / "reviewer.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(marker)!r}).write_text('called\\n')\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+                subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+                subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                cmd = [
+                    "loop", "--root", str(root), f"Low risk {name}",
+                    "--verify", "git diff --check",
+                    "--executor-command", f"{sys.executable} executor.py",
+                    "--reviewer-command", f"{sys.executable} reviewer.py",
+                ]
+                for path in allowed:
+                    cmd.extend(["--allow", path])
+                res = run(cmd)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertFalse(marker.exists())
+                cur = json.loads((root / ".cfc" / "current.json").read_text())
+                rd = root / ".cfc" / "runs" / cur["last_run_id"]
+                review = (rd / "REVIEW.iteration-1.md").read_text()
+                self.assertIn("Reviewer adapter skipped", review)
 
     def test_blocked_loop_executes_repair_once_per_blocker_cycle(self):
         td, root = self.make_repo()
