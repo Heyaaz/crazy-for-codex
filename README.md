@@ -69,6 +69,14 @@ are reached through GJC and used only as executors. `{prompt_file}` is expanded 
 to a temporary prompt file so GJC can receive long prompts as `@file` input instead
 of oversized shell argv/stdin assumptions.
 
+Live command adapters (`gjc`, `opencode`, and nested `codex exec`) should run
+from an external terminal or tmux pane, not from the Codex App sandbox. These
+CLIs write machine-local runtime state such as `~/.gjc` logs and `~/.codex`
+SQLite state; inside the app sandbox CfC refuses early and prints the external
+terminal command to run instead. If you intentionally want to bypass the guard
+in an environment with writable runtime homes, set
+`CFC_ALLOW_SANDBOX_LIVE_ADAPTERS=1`.
+
 ```json
 {
   "adapters": {

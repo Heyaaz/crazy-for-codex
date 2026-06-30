@@ -12,8 +12,8 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "cfc.py"
 
 
-def run(args, cwd=None):
-    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run(args, cwd=None, env=None):
+    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 class CfCTest(unittest.TestCase):
@@ -659,6 +659,67 @@ class CfCTest(unittest.TestCase):
         self.assertIn("Fallback: `yes`", fallback)
         run_data = json.loads((rd / "RUN.json").read_text())
         self.assertEqual(run_data["runner"]["executor_fallback_used"]["profile"], "codex-executor")
+        self.assertTrue((rd / "DONE.md").exists())
+
+    def test_live_command_profiles_refuse_inside_codex_sandbox_before_start(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        (root / "cfc.config.json").write_text(json.dumps({
+            "adapters": {
+                "mode": "command",
+                "executor_profile": "glm",
+                "reviewer_profile": "codex",
+                "profiles": {
+                    "glm": {"command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}"},
+                    "codex-executor": {"command": "codex exec --dangerously-bypass-approvals-and-sandbox -"},
+                    "codex": {"command": "codex exec --sandbox read-only -"},
+                },
+                "fallbacks": {"glm": ["codex-executor"]},
+            },
+            "verification": {"commands": ["git diff --check"]},
+        }))
+        subprocess.run(["git", "add", "cfc.config.json"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "live adapter config"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = os.environ.copy()
+        env["CODEX_SANDBOX"] = "seatbelt"
+        env.pop("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS", None)
+        res = run(["plugin", "run", "--root", str(root), "Sandbox live adapter"], env=env)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("CfC live command adapters are disabled inside the Codex App sandbox", res.stderr)
+        self.assertIn("external terminal", res.stderr)
+        self.assertIn("gjc -p --model opencode-go/glm-5.2", res.stderr)
+        self.assertIn("codex exec --sandbox read-only", res.stderr)
+        self.assertIn("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS=1", res.stderr)
+        self.assertFalse((root / ".cfc").exists())
+
+    def test_local_command_profiles_still_run_inside_codex_sandbox(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        marker = root / ".cfc" / "local_executor_called.txt"
+        (root / "executor.py").write_text(f"import pathlib, sys\nsys.stdin.read()\npathlib.Path({str(marker)!r}).write_text('ok\\n')\nprint('executor done')\n")
+        (root / "reviewer.py").write_text("import sys\nsys.stdin.read()\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        (root / "cfc.config.json").write_text(json.dumps({
+            "adapters": {
+                "mode": "command",
+                "executor_profile": "local",
+                "reviewer_profile": "local-reviewer",
+                "profiles": {
+                    "local": {"command": f"{sys.executable} executor.py"},
+                    "local-reviewer": {"command": f"{sys.executable} reviewer.py"},
+                },
+            },
+            "verification": {"commands": ["git diff --check"]},
+        }))
+        subprocess.run(["git", "add", "executor.py", "reviewer.py", "cfc.config.json"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "local adapter config"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = os.environ.copy()
+        env["CODEX_SANDBOX"] = "seatbelt"
+        env.pop("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS", None)
+        res = run(["plugin", "run", "--root", str(root), "Sandbox local adapter"], env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertTrue(marker.exists())
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["last_run_id"]
         self.assertTrue((rd / "DONE.md").exists())
 
     def test_cli_executor_profile_overrides_config_auto(self):

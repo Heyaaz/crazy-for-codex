@@ -23,6 +23,7 @@ from .paths import cfc_path, root_path
 from .prompts import build_prompt, render_blockers_md, render_repair_prompt, render_review_prompt
 from .review_result import extract_review_result_name, is_review_infrastructure_blocker, parse_review_result
 from .review_workflow import classify_review_file, run_agent_command
+from .runtime_env import enforce_external_terminal_for_live_adapters
 from .state import active_run
 from .tmux_ops import ensure_isolated_tmux_targets, render_reviewer_timeout_result, send_tmux_prompt, tmux_capture, wait_for_tmux_verdict
 
@@ -285,6 +286,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
         raise SystemExit("cfc loop requires an executor adapter: pass --executor-command or use --send with --executor-target")
     if not args.reviewer_command and not args.send:
         raise SystemExit("cfc loop requires an independent reviewer: pass --reviewer-command or use --send with --reviewer-target")
+    enforce_external_terminal_for_live_adapters(args, root)
     if not cfc_path(root).exists():
         cmd_init(argparse.Namespace(root=str(root)))
     start_args = argparse.Namespace(

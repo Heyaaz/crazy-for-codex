@@ -76,6 +76,13 @@ authority and the fallback executor when GLM is unavailable or exits nonzero:
 - `codex-executor`: Codex executor for GLM command failure fallback.
 - `codex`: read-only Codex reviewer and final verdict authority.
 
+Live command-mode adapters must run outside the Codex App sandbox. CfC should
+refuse early when `CODEX_SANDBOX` is active and configured commands include
+`gjc`, `opencode`, or nested `codex exec`, because those tools need writable
+machine-local runtime state (`~/.gjc`, `~/.codex`). The refusal should print an
+external terminal/tmux `cfc plugin run ...` command. Local deterministic command
+adapters used by tests remain allowed inside the sandbox.
+
 ## Data Model
 
 ```text
