@@ -28,7 +28,7 @@ DEFAULT_IGNORED_STATUS_PATTERNS = [
 
 TRUE_STRINGS = {"1", "true", "True", "yes", "on"}
 FALSE_STRINGS = {"0", "false", "False", "no", "off"}
-DEFAULT_CHEAP_EXECUTOR_COMMAND = "opencode run --model kimi-k2.7-code -"
-DEFAULT_COMPLEX_EXECUTOR_COMMAND = "opencode run --model glm-5.2 -"
+DEFAULT_CHEAP_EXECUTOR_COMMAND = "gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}"
+DEFAULT_COMPLEX_EXECUTOR_COMMAND = "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}"
 DEFAULT_FRONTIER_EXECUTOR_COMMAND = "codex exec --dangerously-bypass-approvals-and-sandbox -"
 DEFAULT_CODEX_REVIEWER_COMMAND = "codex exec --sandbox read-only -"

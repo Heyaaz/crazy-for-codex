@@ -11,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -23,14 +24,28 @@ from .state import active_run
 from .tmux_ops import send_tmux_prompt
 
 def run_agent_command(command: str, prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
+    prompt_file: Path | None = None
+    stdin = prompt
+    if "{prompt_file}" in command:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix="cfc-agent-prompt-", suffix=".md", delete=False) as f:
+            f.write(prompt)
+            prompt_file = Path(f.name)
+        command = command.replace("{prompt_file}", shlex.quote(str(prompt_file)))
+        stdin = None
     try:
-        return subprocess.run(command, cwd=str(cwd), input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, timeout=timeout)
+        return subprocess.run(command, cwd=str(cwd), input=stdin, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         timeout_msg = f"command timed out after {timeout} seconds"
         stderr = (stderr + "\n" if stderr else "") + timeout_msg
         return subprocess.CompletedProcess(command, 124, stdout, stderr)
+    finally:
+        if prompt_file:
+            try:
+                prompt_file.unlink()
+            except FileNotFoundError:
+                pass
 
 def classify_review_file(root: Path, run: dict[str, Any], rd: Path, path: Path) -> dict[str, Any]:
     parsed = parse_review_result(path.read_text(encoding="utf-8", errors="ignore"))

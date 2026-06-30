@@ -60,12 +60,14 @@ plus optional local `.cfc/config.local.json` overrides. This repository ships a
 cost-optimized command-mode default:
 
 - executor profile `auto`
-  - localized/simple tasks -> `cheap` -> `opencode run --model kimi-k2.7-code -`
-  - broad/async/state/security/migration tasks -> `complex` -> `opencode run --model glm-5.2 -`
+  - localized/simple tasks -> `cheap` -> `gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}`
+  - broad/async/state/security/migration tasks -> `complex` -> `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}`
 - reviewer profile `codex` -> `codex exec --sandbox read-only -`
 
-The reviewer remains the only final PASS/REVIEW_BLOCKED authority; open models
-are used only as executors.
+The reviewer remains the only final PASS/REVIEW_BLOCKED authority; OpenCode Go models
+are reached through GJC and used only as executors. `{prompt_file}` is expanded by CfC
+to a temporary prompt file so GJC can receive long prompts as `@file` input instead
+of oversized shell argv/stdin assumptions.
 
 ```json
 {
@@ -74,8 +76,8 @@ are used only as executors.
     "executor_profile": "auto",
     "reviewer_profile": "codex",
     "profiles": {
-      "cheap": { "command": "opencode run --model kimi-k2.7-code -" },
-      "complex": { "command": "opencode run --model glm-5.2 -" },
+      "cheap": { "command": "gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}" },
+      "complex": { "command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}" },
       "codex": { "command": "codex exec --sandbox read-only -" }
     }
   }

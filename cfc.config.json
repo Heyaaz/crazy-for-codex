@@ -6,16 +6,16 @@
     "reviewer_profile": "codex",
     "profiles": {
       "cheap": {
-        "provider": "opencode",
-        "model": "kimi-k2.7-code",
-        "command": "opencode run --model kimi-k2.7-code -",
-        "purpose": "Default low-cost coding executor for small, localized implementation and blocker repair tasks."
+        "provider": "opencode-go",
+        "model": "opencode-go/kimi-k2.7-code",
+        "command": "gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}",
+        "purpose": "Default low-cost GJC executor using OpenCode Go Kimi K2.7 Code for small, localized implementation and blocker repair tasks."
       },
       "complex": {
-        "provider": "opencode",
-        "model": "glm-5.2",
-        "command": "opencode run --model glm-5.2 -",
-        "purpose": "Escalated executor for broad context, async/state, architecture, migration, or multi-file work."
+        "provider": "opencode-go",
+        "model": "opencode-go/glm-5.2",
+        "command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}",
+        "purpose": "Escalated GJC executor using OpenCode Go GLM-5.2 for broad context, async/state, architecture, migration, or multi-file work."
       },
       "frontier": {
         "provider": "codex",

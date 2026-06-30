@@ -393,6 +393,32 @@ class CfCTest(unittest.TestCase):
                 offenders.append(str(path.relative_to(SCRIPT.parents[1])))
         self.assertEqual(offenders, [])
 
+    def test_repo_default_config_uses_gjc_opencode_go_profiles(self):
+        config = json.loads((SCRIPT.parents[1] / "cfc.config.json").read_text(encoding="utf-8"))
+        profiles = config["adapters"]["profiles"]
+        self.assertEqual(profiles["cheap"]["provider"], "opencode-go")
+        self.assertEqual(profiles["cheap"]["model"], "opencode-go/kimi-k2.7-code")
+        self.assertIn("gjc -p --model opencode-go/kimi-k2.7-code", profiles["cheap"]["command"])
+        self.assertIn("@{prompt_file}", profiles["cheap"]["command"])
+        self.assertEqual(profiles["complex"]["provider"], "opencode-go")
+        self.assertEqual(profiles["complex"]["model"], "opencode-go/glm-5.2")
+        self.assertIn("gjc -p --model opencode-go/glm-5.2", profiles["complex"]["command"])
+        self.assertNotIn("opencode run", json.dumps(config))
+
+    def test_agent_command_prompt_file_placeholder_writes_and_cleans_temp_file(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_prompt_file", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        code = "import pathlib, sys; p=pathlib.Path(sys.argv[1]); print(str(p)); print(p.read_text())"
+        command = f"{sys.executable} -c {json.dumps(code)} {{prompt_file}}"
+        res = module.run_agent_command(command, "hello from prompt file\n", SCRIPT.parents[1], 10)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        path = Path(res.stdout.splitlines()[0])
+        self.assertIn("hello from prompt file", res.stdout)
+        self.assertFalse(path.exists())
+
     def test_plugin_manifest_is_machine_readable(self):
         res = run(["plugin", "manifest"])
         self.assertEqual(res.returncode, 0, res.stderr)

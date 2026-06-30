@@ -68,11 +68,11 @@ cfc events
 
 The review evidence includes `git status`, unstaged diff, staged diff, and small text untracked files. Reviewer failure or empty reviewer output is treated as `REVIEW_BLOCKED`, never PASS.
 
-Default cost-optimized config uses open models only for execution and Codex for
-review:
+Default cost-optimized config reaches OpenCode Go models through GJC and uses
+them only for execution; Codex remains the independent review authority:
 
-- `cheap`: Kimi K2.7 Code executor for localized implementation.
-- `complex`: GLM-5.2 executor for broad/async/state/security/migration work.
+- `cheap`: `gjc -p --model opencode-go/kimi-k2.7-code --no-session @{prompt_file}` for localized implementation.
+- `complex`: `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}` for broad/async/state/security/migration work.
 - `codex`: read-only Codex reviewer and final verdict authority.
 
 ## Data Model
