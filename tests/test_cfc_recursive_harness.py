@@ -13,8 +13,8 @@ from unittest import mock
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "cfc.py"
 
 
-def run(args, cwd=None, env=None):
-    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run(args, cwd=None, env=None, input=None):
+    return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=cwd, env=env, input=input, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 class CfCTest(unittest.TestCase):
@@ -902,6 +902,162 @@ class CfCTest(unittest.TestCase):
         self.assertIn("run", manifest["commands"])
         self.assertIn("status", manifest["commands"])
         self.assertEqual(manifest["adapter_protocols"]["gjc-rpc"]["transport"], "jsonl-stdio")
+
+    def test_hook_user_prompt_submit_strict_only_for_cfc_keyword(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        res = run(
+            ["hook", "user-prompt-submit", "--root", str(root), "--json"],
+            input=json.dumps({"prompt": "cfc 로 진행"}),
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["mode"], "strict")
+        self.assertEqual(payload["reason"], "explicit_cfc_keyword")
+        self.assertIn("<cfc-router-mode>", payload["injection"])
+
+        res = run(
+            ["hook", "user-prompt-submit", "--root", str(root), "--json"],
+            input=json.dumps({"prompt": "README 정리해줘"}),
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["mode"], "light")
+        self.assertEqual(payload["reason"], "no_cfc_keyword")
+        self.assertEqual(payload["injection"], "")
+
+    def test_hook_user_prompt_submit_includes_sandbox_handoff_for_live_adapters(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        (root / "cfc.config.json").write_text(json.dumps({
+            "adapters": {
+                "mode": "command",
+                "executor_profile": "glm",
+                "reviewer_profile": "codex",
+                "profiles": {
+                    "glm": {"command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}"},
+                    "codex": {"command": "codex exec --sandbox read-only -"},
+                },
+            },
+        }))
+        subprocess.run(["git", "add", "cfc.config.json"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "live adapter config"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = os.environ.copy()
+        env["CODEX_SANDBOX"] = "seatbelt"
+        env.pop("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS", None)
+        res = run(
+            ["hook", "user-prompt-submit", "--root", str(root), "--json"],
+            env=env,
+            input=json.dumps({"prompt": "cfc 로 진행"}),
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["mode"], "strict")
+        self.assertTrue(payload["handoff"]["handoff_required"])
+        self.assertIn("Codex App external-terminal handoff", payload["injection"])
+        self.assertIn("--handoff-only", payload["injection"])
+        self.assertIn("Do not run `cfc plugin run` directly", payload["injection"])
+
+    def test_hook_user_prompt_submit_reminds_when_active_run_exists(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Active reminder"])
+        res = run(
+            ["hook", "user-prompt-submit", "--root", str(root), "--json"],
+            input=json.dumps({"prompt": "status?"}),
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["mode"], "light")
+        self.assertEqual(payload["reason"], "active_run_reminder")
+        self.assertIn("<cfc-active-run>", payload["injection"])
+
+    def test_hook_stop_blocks_unresolved_active_run(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Stop guard"])
+        res = run(["hook", "stop", "--root", str(root), "--json"])
+        self.assertEqual(res.returncode, 2)
+        payload = json.loads(res.stdout)
+        self.assertTrue(payload["block"])
+        self.assertIn("CHECK.md is missing", "\n".join(payload["blockers"]))
+        self.assertIn("DONE.md is missing", "\n".join(payload["blockers"]))
+
+    def test_hook_stop_allows_without_active_run(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        res = run(["hook", "stop", "--root", str(root), "--json"])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertFalse(payload["block"])
+        self.assertEqual(payload["reason"], "no_active_run")
+
+    def test_hook_subagent_stop_blocks_missing_required_receipt(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        env = os.environ.copy()
+        env["CFC_REQUIRE_EVIDENCE_RECEIPTS"] = "1"
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Receipt guard", "--allow", "src/app.py"], env=env)
+        res = run(["hook", "subagent-stop", "--root", str(root), "--json"], input="done")
+        self.assertEqual(res.returncode, 2)
+        payload = json.loads(res.stdout)
+        self.assertTrue(payload["required"])
+        self.assertTrue(payload["block"])
+        self.assertIn("no CFC_EVIDENCE_RECORDED line", "\n".join(payload["blockers"]))
+
+    def test_hook_subagent_stop_accepts_valid_required_receipt(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        env = os.environ.copy()
+        env["CFC_REQUIRE_EVIDENCE_RECEIPTS"] = "1"
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Receipt guard", "--allow", "src/app.py"], env=env)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        evidence = rd / "evidence" / "subagent.txt"
+        evidence.write_text("verified evidence\n")
+        res = run(
+            ["hook", "subagent-stop", "--root", str(root), "--json"],
+            input=f"CFC_EVIDENCE_RECORDED: .cfc/runs/{cur['run_id']}/evidence/subagent.txt\n",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertTrue(payload["required"])
+        self.assertFalse(payload["block"])
+        self.assertEqual(payload["receipt_count"], 1)
+
+    def test_plugin_run_handoff_only_reports_external_terminal_command_without_starting_run(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        (root / "cfc.config.json").write_text(json.dumps({
+            "adapters": {
+                "mode": "command",
+                "executor_profile": "glm",
+                "reviewer_profile": "codex",
+                "profiles": {
+                    "glm": {"command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}"},
+                    "codex": {"command": "codex exec --sandbox read-only -"},
+                },
+            },
+        }))
+        subprocess.run(["git", "add", "cfc.config.json"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "live adapter config"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = os.environ.copy()
+        env["CODEX_SANDBOX"] = "seatbelt"
+        env.pop("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS", None)
+        res = run(["plugin", "run", "--root", str(root), "CFC handoff", "--handoff-only"], env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["status"], "handoff_only")
+        self.assertTrue(payload["handoff_required"])
+        self.assertIn("cfc plugin run", payload["external_command"])
+        self.assertIn("gjc -p --model", json.dumps(payload["live_adapter_attempts"]))
+        self.assertFalse((root / ".cfc").exists())
 
     def test_plugin_status_reports_active_run_json(self):
         td, root = self.make_repo()

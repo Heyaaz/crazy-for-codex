@@ -13,6 +13,7 @@ from .review_result import *
 from .evidence import *
 from .quality_gate import *
 from .gjc_rpc import *
+from .hooks import *
 from .learn import *
 from .commands_core import *
 from .review_workflow import *

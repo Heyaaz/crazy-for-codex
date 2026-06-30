@@ -47,7 +47,49 @@ cfc plugin cancel --root /path/to/repo
 
 All plugin status outputs are JSON so Codex/OMX/GJC adapters can render their own UI.
 
+When a host is running inside the Codex App sandbox and the selected adapters
+are live commands such as `gjc` or `codex exec`, ask CfC for a handoff instead
+of attempting the run in-place:
+
+```bash
+cfc plugin run "Fix small UI issue" --root /path/to/repo --handoff-only
+```
+
+This prints JSON with `handoff_required`, detected live adapter commands, and
+the exact `external_command` to run from an unsandboxed terminal or tmux pane.
+It does not create `.cfc/` state or start a run.
+
 Workspace roots that are not git repositories are selector surfaces, not run targets. In that case `cfc plugin status --root <workspace>` returns `error: not_a_git_repository` plus `nested_git_roots`; adapters must choose one or more explicit nested repo roots and run CfC separately per repo. `cfc plugin run` refuses before creating `.cfc/` when the selected root is not a git repo.
+
+## Hook shim
+
+CfC also ships thin hook entrypoints. They are intentionally lighter than the
+recursive loop: hooks route or block only at the points where CFC assurance can
+be bypassed.
+
+```bash
+cfc hook user-prompt-submit --root /path/to/repo
+cfc hook stop --root /path/to/repo
+cfc hook subagent-stop --root /path/to/repo
+```
+
+Policy:
+
+- No explicit CFC keyword -> light mode. The router hook normally emits no
+  context and does not force a CFC run.
+- Explicit `cfc` / `$cfc` / `cfc 로` / `cfc 돌려` style prompt -> strict router
+  context. The next agent turn must start with `cfc plugin status` and may not
+  perform direct repo work before CFC accepts or refuses.
+- If strict routing happens inside the Codex App sandbox and configured
+  adapters are live commands, the router context includes an external-terminal
+  handoff and tells the agent not to run `cfc plugin run` directly in the app.
+- Active CFC run -> stop guard blocks unresolved exits until the run has check,
+  review, and DONE evidence, or the run is explicitly cancelled.
+- Evidence receipt guard blocks subagent stop only when the active run requires
+  receipts or the hook is invoked with `--strict`.
+
+Use `--json` for machine-readable decisions; otherwise stdout is suitable for
+prompt/context injection or concise blocking text.
 
 ## Headless CLI defaults
 

@@ -20,6 +20,7 @@ from .constants import TRACKED_CONFIG_FILE, VERSION
 from .git_ops import git_branch, git_status_short, is_git_repo, nearest_git_root, non_repo_payload, parse_status_files, resolve_plugin_root
 from .loop import cmd_loop, default_loop_namespace
 from .paths import cfc_path, current_file, root_path
+from .runtime_env import external_terminal_handoff_payload
 from .state import active_run, current_active_run_or_none
 
 def run_summary(root: Path) -> dict[str, Any]:
@@ -77,6 +78,7 @@ def cmd_plugin_manifest(args: argparse.Namespace) -> None:
         "config_file": TRACKED_CONFIG_FILE,
         "commands": {
             "run": "Start/replace a recursive loop for a task.",
+            "run --handoff-only": "Return the external-terminal command needed for live adapters without starting a run.",
             "status": "Return machine-readable repo/run status.",
             "events": "Return recent active-run ledger events.",
             "cancel": "Clear the active run pointer without deleting artifacts.",
@@ -170,5 +172,10 @@ def cmd_plugin_run(args: argparse.Namespace) -> None:
         ns.allow = args.allow
     if args.forbid:
         ns.forbid = args.forbid
+    if getattr(args, "handoff_only", False):
+        payload = external_terminal_handoff_payload(root_path_value, ns)
+        payload["status"] = "handoff_only"
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
     cmd_loop(ns)
     print(json.dumps(run_summary(Path(root)), indent=2, ensure_ascii=False))

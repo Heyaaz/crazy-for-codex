@@ -17,6 +17,7 @@ from typing import Any
 from .commands_core import cmd_check, cmd_diff, cmd_done, cmd_events, cmd_init, cmd_park, cmd_review, cmd_start, cmd_status
 from .constants import TRACKED_CONFIG_FILE, VERSION
 from .git_ops import nearest_git_root
+from .hooks import cmd_hook_stop, cmd_hook_subagent_stop, cmd_hook_user_prompt_submit
 from .learn import cmd_learn
 from .loop import cmd_capture, cmd_gjc, cmd_loop, default_loop_namespace
 from .plugin import cmd_plugin_cancel, cmd_plugin_events, cmd_plugin_manifest, cmd_plugin_run, cmd_plugin_status
@@ -28,7 +29,9 @@ def print_headless_help() -> None:
 Usage:
   cfc plugin manifest
   cfc plugin run "task" --root /path/to/repo [--replace] [--allow-dirty]
+  cfc plugin run "task" --root /path/to/repo --handoff-only
   cfc plugin status --root /path/to/repo
+  cfc hook user-prompt-submit|stop|subagent-stop --root /path/to/repo
   cfc loop --root /path/to/repo "task" --executor-command ... --reviewer-command ...
   cfc "task" --root /path/to/repo
 
@@ -40,7 +43,7 @@ Tracked config: `{TRACKED_CONFIG_FILE}` can define command-mode executor/reviewe
 def known_commands() -> set[str]:
     return {
         "init", "start", "status", "gjc", "capture", "check", "diff", "review",
-        "classify-review", "repair", "loop", "park", "learn", "done", "events", "plugin",
+        "classify-review", "repair", "loop", "park", "learn", "done", "events", "plugin", "hook",
     }
 
 def run_bare_request(argv: list[str]) -> int:
@@ -233,7 +236,27 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--allow-dirty", action="store_true")
     sp.add_argument("--replace", action="store_true")
     sp.add_argument("--no-review-on-check-fail", action="store_true")
+    sp.add_argument("--handoff-only", action="store_true", help="Print external-terminal handoff JSON without starting a run")
     sp.set_defaults(func=cmd_plugin_run)
+
+    hook = sub.add_parser("hook", help="Thin hook shim for routing and recursive-assurance guards")
+    hook_sub = hook.add_subparsers(dest="hook_cmd", required=True)
+
+    sp = hook_sub.add_parser("user-prompt-submit", help="Emit strict CFC router context only for explicit CFC prompts")
+    add_root(sp)
+    sp.add_argument("--json", action="store_true", help="Emit machine-readable hook decision JSON")
+    sp.set_defaults(func=cmd_hook_user_prompt_submit)
+
+    sp = hook_sub.add_parser("stop", help="Block stopping when an active CFC run is unresolved")
+    add_root(sp)
+    sp.add_argument("--json", action="store_true", help="Emit machine-readable hook decision JSON")
+    sp.set_defaults(func=cmd_hook_stop)
+
+    sp = hook_sub.add_parser("subagent-stop", help="Validate CFC evidence receipts for active strict runs")
+    add_root(sp)
+    sp.add_argument("--json", action="store_true", help="Emit machine-readable hook decision JSON")
+    sp.add_argument("--strict", action="store_true", help="Require an evidence receipt even if the active run did not opt in")
+    sp.set_defaults(func=cmd_hook_subagent_stop)
 
     sp = sub.add_parser("events")
     add_root(sp)

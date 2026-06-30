@@ -124,6 +124,21 @@ def external_terminal_block_message(root: Path, args: argparse.Namespace, attemp
         "set CFC_ALLOW_SANDBOX_LIVE_ADAPTERS=1."
     )
 
+def external_terminal_handoff_payload(root: Path, args: argparse.Namespace) -> dict[str, Any]:
+    attempts = live_adapter_attempts(args)
+    sandbox_active = codex_sandbox_active()
+    bypassed = env_truthy("CFC_ALLOW_SANDBOX_LIVE_ADAPTERS")
+    return {
+        "handoff_required": sandbox_active and bool(attempts) and not bypassed,
+        "reason": "codex_app_sandbox_live_adapters" if sandbox_active and attempts and not bypassed else "not_required",
+        "repo": str(root),
+        "request": str(getattr(args, "request", "")),
+        "sandbox_active": sandbox_active,
+        "allow_sandbox_live_adapters": bypassed,
+        "live_adapter_attempts": attempts,
+        "external_command": external_terminal_command(root, args),
+    }
+
 def enforce_external_terminal_for_live_adapters(args: argparse.Namespace, root: Path) -> None:
     if getattr(args, "send", False):
         return
