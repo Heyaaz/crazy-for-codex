@@ -55,7 +55,34 @@ A bare request still works as a shorthand for plugin-style loop execution:
 cfc "README 정리해줘" --root /path/to/repo
 ```
 
-Default bare/plugin loop settings can be controlled by environment variables:
+Default bare/plugin loop settings can be controlled by tracked `cfc.config.json`
+plus optional local `.cfc/config.local.json` overrides. This repository ships a
+cost-optimized command-mode default:
+
+- executor profile `auto`
+  - localized/simple tasks -> `cheap` -> `opencode run --model kimi-k2.7-code -`
+  - broad/async/state/security/migration tasks -> `complex` -> `opencode run --model glm-5.2 -`
+- reviewer profile `codex` -> `codex exec --sandbox read-only -`
+
+The reviewer remains the only final PASS/REVIEW_BLOCKED authority; open models
+are used only as executors.
+
+```json
+{
+  "adapters": {
+    "mode": "command",
+    "executor_profile": "auto",
+    "reviewer_profile": "codex",
+    "profiles": {
+      "cheap": { "command": "opencode run --model kimi-k2.7-code -" },
+      "complex": { "command": "opencode run --model glm-5.2 -" },
+      "codex": { "command": "codex exec --sandbox read-only -" }
+    }
+  }
+}
+```
+
+Legacy environment variables are still accepted as fallbacks:
 
 ```text
 CFC_EXECUTOR_COMMAND
@@ -85,8 +112,8 @@ python3 scripts/cfc.py loop --root /path/to/repo \
   "Fix small UI issue" \
   --allow 'src/Foo.tsx' \
   --verify 'npm run lint' \
-  --executor-command 'codex exec ...' \
-  --reviewer-command 'codex exec --readonly ...'
+  --executor-profile cheap \
+  --reviewer-profile codex
 ```
 
 Synchronous command-mode flow:

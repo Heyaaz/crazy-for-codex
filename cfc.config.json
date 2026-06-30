@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "adapters": {
+    "mode": "command",
+    "executor_profile": "auto",
+    "reviewer_profile": "codex",
+    "profiles": {
+      "cheap": {
+        "provider": "opencode",
+        "model": "kimi-k2.7-code",
+        "command": "opencode run --model kimi-k2.7-code -",
+        "purpose": "Default low-cost coding executor for small, localized implementation and blocker repair tasks."
+      },
+      "complex": {
+        "provider": "opencode",
+        "model": "glm-5.2",
+        "command": "opencode run --model glm-5.2 -",
+        "purpose": "Escalated executor for broad context, async/state, architecture, migration, or multi-file work."
+      },
+      "frontier": {
+        "provider": "codex",
+        "model": "codex-default",
+        "command": "codex exec --dangerously-bypass-approvals-and-sandbox -",
+        "purpose": "Optional high-capability executor profile for tasks that should not use open models."
+      },
+      "codex": {
+        "provider": "codex",
+        "model": "codex-default",
+        "command": "codex exec --sandbox read-only -",
+        "purpose": "Strict independent reviewer. Keep final PASS/REVIEW_BLOCKED authority here."
+      }
+    },
+    "auto": {
+      "default_executor_profile": "cheap",
+      "complex_executor_profile": "complex",
+      "complex_keywords": [
+        "architecture",
+        "architect",
+        "multi-file",
+        "refactor",
+        "migration",
+        "security",
+        "auth",
+        "async",
+        "tmux",
+        "state",
+        "concurrency",
+        "race",
+        "database",
+        "schema",
+        "protocol",
+        "아키텍처",
+        "여러 파일",
+        "리팩터",
+        "마이그레이션",
+        "보안",
+        "인증",
+        "비동기",
+        "상태",
+        "동시성",
+        "복잡"
+      ]
+    }
+  },
+  "verification": {
+    "commands": [
+      "git diff --check"
+    ]
+  }
+}

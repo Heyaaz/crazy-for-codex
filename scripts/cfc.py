@@ -22,6 +22,7 @@ from typing import Any
 
 VERSION = "0.7.0"
 CFC_DIR = ".cfc"
+TRACKED_CONFIG_FILE = "cfc.config.json"
 DEFAULT_FORBIDDEN_PATHS = [
     "AGENTS.md",
     "package-lock.json",
@@ -44,6 +45,41 @@ DEFAULT_IGNORED_STATUS_PATTERNS = [
     "*.pyc",
     "**/*.pyc",
 ]
+
+TRUE_STRINGS = {"1", "true", "True", "yes", "on"}
+FALSE_STRINGS = {"0", "false", "False", "no", "off"}
+DEFAULT_CHEAP_EXECUTOR_COMMAND = "opencode run --model kimi-k2.7-code -"
+DEFAULT_COMPLEX_EXECUTOR_COMMAND = "opencode run --model glm-5.2 -"
+DEFAULT_FRONTIER_EXECUTOR_COMMAND = "codex exec --dangerously-bypass-approvals-and-sandbox -"
+DEFAULT_CODEX_REVIEWER_COMMAND = "codex exec --sandbox read-only -"
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    if value in TRUE_STRINGS:
+        return True
+    if value in FALSE_STRINGS:
+        return False
+    return default
+
+
+def first_nonempty(*values: Any) -> Any:
+    for value in values:
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def default_status_patterns() -> list[str]:
@@ -309,8 +345,94 @@ def git_review_diff(root: Path, max_file_chars: int = 20000) -> str:
 
 
 def load_config(root: Path) -> dict[str, Any]:
-    path = cfc_path(root) / "config.json"
-    return read_json(path, default={})
+    config: dict[str, Any] = {}
+    local = cfc_path(root) / "config.json"
+    if local.exists():
+        config = deep_merge(config, read_json(local, default={}))
+    tracked = root / TRACKED_CONFIG_FILE
+    if tracked.exists():
+        # Tracked repo config overrides generated `.cfc/config.json` defaults.
+        config = deep_merge(config, read_json(tracked, default={}))
+    local_override = cfc_path(root) / "config.local.json"
+    if local_override.exists():
+        # Optional ignored local override for private machine-specific commands.
+        config = deep_merge(config, read_json(local_override, default={}))
+    return config
+
+
+def adapter_config(config: dict[str, Any]) -> dict[str, Any]:
+    adapters = config.get("adapters") or config.get("adapter") or {}
+    return adapters if isinstance(adapters, dict) else {}
+
+
+def adapter_profiles(config: dict[str, Any]) -> dict[str, Any]:
+    profiles = adapter_config(config).get("profiles") or {}
+    return profiles if isinstance(profiles, dict) else {}
+
+
+def configured_profile_command(config: dict[str, Any], profile: str | None) -> str | None:
+    if not profile:
+        return None
+    profiles = adapter_profiles(config)
+    value = profiles.get(profile)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        command = value.get("command")
+        return str(command) if command else None
+    return None
+
+
+def configured_reviewer_command(config: dict[str, Any], profile: str | None = None) -> str | None:
+    adapters = adapter_config(config)
+    profile_name = profile or adapters.get("reviewer_profile") or adapters.get("reviewerProfile") or "codex"
+    return configured_profile_command(config, str(profile_name)) or configured_profile_command(config, "codex-reviewer")
+
+
+def request_looks_complex(request: str, config: dict[str, Any]) -> bool:
+    adapters = adapter_config(config)
+    auto = adapters.get("auto") if isinstance(adapters.get("auto"), dict) else {}
+    keywords = auto.get("complex_keywords") or auto.get("complexKeywords") or [
+        "architecture", "architect", "multi-file", "refactor", "migration", "security", "auth",
+        "async", "tmux", "state", "concurrency", "race", "database", "schema", "protocol",
+        "아키텍처", "여러 파일", "리팩터", "마이그레이션", "보안", "인증", "비동기", "상태", "동시성", "복잡",
+    ]
+    lowered = request.lower()
+    return any(str(k).lower() in lowered for k in keywords)
+
+
+def select_executor_profile(request: str, config: dict[str, Any], explicit_profile: str | None = None) -> str | None:
+    adapters = adapter_config(config)
+    profile = explicit_profile or adapters.get("executor_profile") or adapters.get("executorProfile")
+    if not profile:
+        return None
+    profile = str(profile)
+    if profile != "auto":
+        return profile
+    auto = adapters.get("auto") if isinstance(adapters.get("auto"), dict) else {}
+    complex_profile = str(auto.get("complex_executor_profile") or auto.get("complexExecutorProfile") or "complex")
+    default_profile = str(auto.get("default_executor_profile") or auto.get("defaultExecutorProfile") or "cheap")
+    return complex_profile if request_looks_complex(request, config) else default_profile
+
+
+def configured_executor_command(config: dict[str, Any], request: str, profile: str | None = None) -> tuple[str | None, str | None]:
+    selected = select_executor_profile(request, config, profile)
+    return configured_profile_command(config, selected), selected
+
+
+def apply_configured_adapters(args: argparse.Namespace, root: Path) -> None:
+    if getattr(args, "send", False):
+        return
+    config = load_config(root)
+    if not getattr(args, "executor_command", None):
+        command, profile = configured_executor_command(config, getattr(args, "request", ""), getattr(args, "executor_profile", None))
+        if command:
+            args.executor_command = command
+            args.executor_profile = profile
+    if not getattr(args, "reviewer_command", None):
+        command = configured_reviewer_command(config, getattr(args, "reviewer_profile", None))
+        if command:
+            args.reviewer_command = command
 
 
 def active_run(root: Path) -> tuple[dict[str, Any], Path]:
@@ -633,6 +755,23 @@ def tmux_send(target: str, text: str) -> None:
     subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], check=True)
 
 
+def send_tmux_prompt(run: dict[str, Any], rd: Path, ledger_phase: str, target: str, text: str, **fields: Any) -> None:
+    try:
+        tmux_send(target, text)
+    except Exception as exc:
+        run["status"] = "send_failed"
+        run["send_error"] = {
+            "phase": ledger_phase,
+            "target": target,
+            "error": str(exc),
+            "at": now_iso(),
+        }
+        write_json(rd / "RUN.json", run)
+        append_ledger(rd, ledger_phase, "fail", target=target, error=str(exc), **fields)
+        raise SystemExit(f"Failed to send {ledger_phase} prompt to tmux target {target}: {exc}") from exc
+    append_ledger(rd, ledger_phase, "sent", target=target, **fields)
+
+
 def tmux_capture(target: str, lines: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["tmux", "capture-pane", "-t", target, "-p", "-S", f"-{lines}"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -652,6 +791,34 @@ def wait_for_tmux_verdict(target: str, lines: int, poll_seconds: float = 5.0, ti
         if timeout_seconds and time.monotonic() - start >= timeout_seconds:
             raise TimeoutError(f"Timed out waiting for final Verdict from {target}")
         time.sleep(poll_seconds)
+
+
+def render_reviewer_timeout_result(target: str, timeout_seconds: int, captured_text: str) -> str:
+    timeout_label = f"{timeout_seconds}s" if timeout_seconds else "the configured wait"
+    excerpt = captured_text[-12000:]
+    return f"""Verdict: REVIEW_BLOCKED
+
+## BLOCKERS
+- reviewer did not complete within {timeout_label} waiting for final Verdict: PASS or Verdict: REVIEW_BLOCKED from {target}; review evidence is incomplete
+
+## MAJOR
+- none
+
+## MINOR
+- none
+
+## Verification gaps
+- reviewer output was incomplete, so CfC converted the timeout into a blocked review artifact instead of waiting indefinitely
+
+## Suggested repair prompt
+- none; resolve reviewer timeout/scope before asking the executor to repair product code
+
+## Captured reviewer output excerpt
+
+```text
+{excerpt}
+```
+"""
 
 
 def short_run_token(run_id: str) -> str:
@@ -698,8 +865,7 @@ def cmd_gjc(args: argparse.Namespace) -> None:
     print(f"Wrote prompt: {p}")
     if args.send:
         target = args.tmux_target or run.get("runner", {}).get("target") or "gjc:0.0"
-        tmux_send(target, prompt)
-        append_ledger(rd, "gjc_send", "sent", target=target, prompt=str(p))
+        send_tmux_prompt(run, rd, "gjc_send", target, prompt, prompt_path=str(p))
         print(f"Sent prompt to tmux target: {target}")
 
 
@@ -716,10 +882,9 @@ def continue_after_executor_capture(root: Path, run: dict[str, Any], rd: Path, i
     append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path))
     reviewer_target = run.get("runner", {}).get("reviewer_target") or os.environ.get("CFC_REVIEWER_TARGET")
     if reviewer_target:
-        tmux_send(reviewer_target, review_prompt)
+        send_tmux_prompt(run, rd, "review_send", reviewer_target, review_prompt, iteration=iteration)
         run["awaiting"] = {"phase": "reviewer", "iteration": iteration, "target": reviewer_target, "prompt": str(review_prompt_path), "since": now_iso()}
         write_json(rd / "RUN.json", run)
-        append_ledger(rd, "review_send", "sent", iteration=iteration, target=reviewer_target)
         append_ledger(rd, "async_loop", "waiting_for_reviewer", iteration=iteration, target=reviewer_target)
         print(f"CfC dispatched reviewer prompt to {reviewer_target} after executor capture.")
     else:
@@ -734,6 +899,13 @@ def continue_after_review_classification(root: Path, run: dict[str, Any], rd: Pa
         append_ledger(rd, "async_loop", "review_pass", iteration=iteration)
         print("CfC review passed. Run `cfc done --root ...` to finalize.")
         return
+    if is_review_infrastructure_blocker(blockers):
+        run["status"] = "review_blocked"
+        run.pop("awaiting", None)
+        write_json(rd / "RUN.json", run)
+        append_ledger(rd, "async_loop", "review_incomplete", iteration=iteration, blocker_count=len(blockers))
+        print("CfC review did not complete cleanly. Inspect REVIEW.iteration-*.md and rerun review after fixing reviewer scope/timeout.")
+        return
     max_iterations = int(run.get("loop", {}).get("max_iterations") or os.environ.get("CFC_MAX_ITERATIONS", "3"))
     if iteration >= max_iterations:
         run["status"] = "review_blocked"
@@ -747,11 +919,10 @@ def continue_after_review_classification(root: Path, run: dict[str, Any], rd: Pa
     append_ledger(rd, "repair_prompt", "done", iteration=iteration, blocker_count=len(blockers), path=str(repair_path))
     executor_target = run.get("runner", {}).get("target") or os.environ.get("CFC_EXECUTOR_TARGET")
     if executor_target:
-        tmux_send(executor_target, repair_prompt)
         next_iteration = iteration + 1
+        send_tmux_prompt(run, rd, "repair_send", executor_target, repair_prompt, iteration=iteration, next_iteration=next_iteration, prompt=str(repair_path))
         run["awaiting"] = {"phase": "executor", "iteration": next_iteration, "target": executor_target, "prompt": str(repair_path), "since": now_iso(), "source_review_iteration": iteration}
         write_json(rd / "RUN.json", run)
-        append_ledger(rd, "repair_send", "sent", iteration=iteration, next_iteration=next_iteration, target=executor_target, prompt=str(repair_path))
         append_ledger(rd, "async_loop", "waiting_for_executor_repair", iteration=next_iteration, target=executor_target, blocker_count=len(blockers))
         print(f"CfC sent BLOCKERS to executor for repair: {executor_target}")
     else:
@@ -773,7 +944,11 @@ def cmd_capture(args: argparse.Namespace) -> None:
             text = wait_for_tmux_verdict(target, args.lines, poll_seconds=args.poll_seconds, timeout_seconds=args.timeout_seconds)
         except TimeoutError as e:
             append_ledger(rd, "capture_wait", "timeout", target=target, timeout_seconds=args.timeout_seconds)
-            raise SystemExit(str(e))
+            if not is_awaiting_reviewer:
+                raise SystemExit(str(e))
+            cap = tmux_capture(target, args.lines)
+            captured_text = cap.stdout if cap.returncode == 0 else cap.stderr
+            text = render_reviewer_timeout_result(target, args.timeout_seconds, captured_text)
     else:
         p = tmux_capture(target, args.lines)
         if p.returncode != 0:
@@ -900,14 +1075,14 @@ def render_check(run: dict[str, Any], changed: list[str], outside: list[str], fo
 def cmd_review(args: argparse.Namespace) -> None:
     root = root_path(args)
     run, rd = active_run(root)
-    diff_text = git_diff(root)
     prompt = f"""# CfC Independent Review Prompt
 
 Repository: {root}
 Run: {run['title']} ({run['id']})
 
-You are the independent read-only reviewer. Do not edit, write, stage, commit, or push.
+You are the independent read-only reviewer. Do not edit, write, stage, commit, push, run tests, or run verification commands.
 Review only the current diff and task contract.
+If there is no current diff and CHECK evidence is already PASS, do not inspect the full repository; return PASS unless the provided artifacts contradict each other.
 
 Classify findings as:
 - BLOCKER: requirement mismatch, runtime breakage, failing verification, API/payload contract break, data/security risk, forbidden scope change.
@@ -936,10 +1111,9 @@ Required output:
     print(f"Wrote review prompt: {path}")
     if args.send:
         target = args.tmux_target or run.get("runner", {}).get("reviewer_target") or run.get("runner", {}).get("target") or "gjc:0.0"
-        tmux_send(target, prompt)
+        send_tmux_prompt(run, rd, "review_send", target, prompt, prompt_path=str(path))
         run["awaiting"] = {"phase": "reviewer", "target": target, "prompt": str(path), "since": now_iso()}
         write_json(rd / "RUN.json", run)
-        append_ledger(rd, "review_send", "sent", target=target, prompt=str(path))
         print(f"Sent review prompt to tmux target: {target}")
 
 
@@ -1141,12 +1315,18 @@ def cmd_done(args: argparse.Namespace) -> None:
         if str(review.get("verdict", "")).upper() == "REVIEW_BLOCKED":
             raise SystemExit("Independent review is REVIEW_BLOCKED. Repair blockers or use --force intentionally.")
     if not getattr(args, "no_auto_learn", False):
+        auto_apply_high = (
+            env_bool("CFC_DONE_AUTO_APPLY_HIGH_LEARN", False)
+            and not args.force
+            and verdict == "PASS"
+            and str(review.get("verdict", "PASS")).upper() != "REVIEW_BLOCKED"
+        )
         learn_md, learn_candidates, applied_candidates = run_learn(
             root,
             run,
             rd,
             apply=getattr(args, "apply_learn", False),
-            auto_apply_high=os.environ.get("CFC_DONE_AUTO_APPLY_HIGH_LEARN", "1") not in {"0", "false", "False", "no"},
+            auto_apply_high=auto_apply_high,
         )
         if applied_candidates:
             print(f"Applied {len(applied_candidates)} high-confidence learn candidate(s) to .cfc/wiki")
@@ -1192,8 +1372,35 @@ def extract_review_result_name(iteration: int) -> str:
     return f"REVIEW.iteration-{iteration}.md"
 
 
+def latest_artifact_excerpt(rd: Path, patterns: list[str], max_chars: int = 20000) -> str:
+    files: list[Path] = []
+    for pattern in patterns:
+        files.extend(p for p in rd.glob(pattern) if p.is_file())
+    if not files:
+        return "(none)"
+    path = sorted(files, key=lambda p: p.stat().st_mtime)[-1]
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    truncated = len(text) > max_chars
+    suffix = "\n...<truncated>" if truncated else ""
+    return f"Source: `{path.name}`\n\n```text\n{text[:max_chars]}{suffix}\n```"
+
+
 def render_review_prompt(run: dict[str, Any], root: Path, rd: Path, iteration: int) -> str:
     check_text = (rd / "CHECK.md").read_text(encoding="utf-8", errors="ignore") if (rd / "CHECK.md").exists() else "(CHECK.md missing)"
+    review_diff = git_review_diff(root)
+    check = run.get("check", {}) or {}
+    no_diff_fast_gate = check.get("verdict") == "PASS" and not check.get("changed_files")
+    executor_excerpt = latest_artifact_excerpt(rd, [f"GJC_LOG.iteration-{iteration}.md", "GJC_LOG.*.md", f"EXECUTION.iteration-{iteration}.md"])
+    fast_gate = ""
+    if no_diff_fast_gate:
+        fast_gate = """
+Fast gate for no-diff runs:
+- CHECK.md says PASS and Changed Files is empty.
+- Do not inspect the repository, read broad docs, or run tests/verification commands.
+- Review only the task contract, CHECK.md, DIFF/current-diff evidence, and executor report excerpt below.
+- If those artifacts are internally consistent, return Verdict: PASS quickly.
+- If the artifacts are incomplete or contradictory, return Verdict: REVIEW_BLOCKED with the artifact gap as the blocker.
+"""
     return f"""# CfC Independent Review Prompt
 
 Repository: {root}
@@ -1201,9 +1408,11 @@ Run: {run['title']} ({run['id']})
 Iteration: {iteration}
 
 You are the independent read-only reviewer in a fresh, clean context.
-Do not edit, write, stage, commit, push, install dependencies, or format files.
+Do not edit, write, stage, commit, push, install dependencies, format files, run tests, or run verification commands.
 Review only the task contract, current diff, and verification evidence below.
 Ignore the executor's confidence; trust the diff and real evidence.
+Do not perform a new repo-wide audit unless the current diff or CHECK evidence explicitly requires it.
+{fast_gate}
 
 Classify findings as:
 - BLOCKER: requirement mismatch, runtime breakage, failing verification, API/payload contract break, data/security risk, forbidden scope change.
@@ -1239,9 +1448,13 @@ Verdict: PASS or REVIEW_BLOCKED
 {check_text[:20000]}
 ```
 
+## Executor Report Excerpt
+
+{executor_excerpt}
+
 ## Current Review Diff
 
-{git_review_diff(root)}
+{review_diff}
 """
 
 
@@ -1276,10 +1489,28 @@ def parse_review_result(text: str) -> dict[str, Any]:
     minor = section_items("MINOR")
     if not verdict_match:
         blockers = ["review missing required final Verdict line"] + blockers
+    elif verdict not in {"PASS", "REVIEW_BLOCKED"}:
+        blockers = [f"review returned unsupported Verdict: {verdict}; expected PASS or REVIEW_BLOCKED"] + blockers
     elif verdict == "REVIEW_BLOCKED" and not blockers:
         blockers = ["review returned REVIEW_BLOCKED without parsed BLOCKERS"]
     blocked = verdict == "REVIEW_BLOCKED" or bool(blockers)
     return {"verdict": "REVIEW_BLOCKED" if blocked else "PASS", "blockers": blockers, "major": major, "minor": minor}
+
+
+def is_review_infrastructure_blocker(blockers: list[str]) -> bool:
+    text = "\n".join(blockers).lower()
+    return any(
+        phrase in text
+        for phrase in [
+            "reviewer did not complete",
+            "timed out waiting for final verdict",
+            "review evidence is incomplete",
+            "review missing required final verdict",
+            "review produced no output",
+            "review returned unsupported verdict",
+            "review returned review_blocked without parsed blockers",
+        ]
+    )
 
 
 def latest_review_result(rd: Path) -> tuple[Path | None, dict[str, Any]]:
@@ -1332,7 +1563,14 @@ Report in the GJC chat/pane only; do not create or edit `DONE.md` or any report 
 
 
 def run_agent_command(command: str, prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=str(cwd), input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, timeout=timeout)
+    try:
+        return subprocess.run(command, cwd=str(cwd), input=prompt, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        timeout_msg = f"command timed out after {timeout} seconds"
+        stderr = (stderr + "\n" if stderr else "") + timeout_msg
+        return subprocess.CompletedProcess(command, 124, stdout, stderr)
 
 
 def classify_review_file(root: Path, run: dict[str, Any], rd: Path, path: Path) -> dict[str, Any]:
@@ -1343,7 +1581,8 @@ def classify_review_file(root: Path, run: dict[str, Any], rd: Path, path: Path) 
         run.pop("awaiting", None)
     write_json(rd / "RUN.json", run)
     append_ledger(rd, "review_classify", parsed["verdict"].lower(), blocker_count=len(parsed["blockers"]), review_file=str(path))
-    learn_md, candidates, applied = run_learn(root, run, rd, auto_apply_high=True)
+    auto_apply_high = env_bool("CFC_REVIEW_AUTO_APPLY_HIGH_LEARN", False) and parsed["verdict"] == "PASS"
+    learn_md, candidates, applied = run_learn(root, run, rd, auto_apply_high=auto_apply_high)
     append_ledger(rd, "learn_after_review", "done", candidate_count=len(candidates), applied_count=len(applied), review_verdict=parsed["verdict"])
     return parsed
 
@@ -1380,16 +1619,16 @@ def cmd_repair(args: argparse.Namespace) -> None:
             raise SystemExit(res.returncode)
     elif args.send:
         target = args.tmux_target or run.get("runner", {}).get("target") or "gjc:0.0"
-        tmux_send(target, prompt)
         next_iteration = args.iteration + 1
+        send_tmux_prompt(run, rd, "repair_send", target, prompt, iteration=args.iteration, next_iteration=next_iteration, prompt=str(path))
         run["awaiting"] = {"phase": "executor", "iteration": next_iteration, "target": target, "prompt": str(path), "since": now_iso(), "source_review_iteration": args.iteration}
         write_json(rd / "RUN.json", run)
-        append_ledger(rd, "repair_send", "sent", iteration=args.iteration, next_iteration=next_iteration, target=target, prompt=str(path))
         print(f"Sent repair prompt to tmux target: {target}")
 
 
 def cmd_loop(args: argparse.Namespace) -> None:
     root = root_path(args)
+    apply_configured_adapters(args, root)
     if not args.executor_command and not args.send:
         raise SystemExit("cfc loop requires an executor adapter: pass --executor-command or use --send with --executor-target")
     if not args.reviewer_command and not args.send:
@@ -1437,8 +1676,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
                 write_json(rd / "RUN.json", run)
                 raise SystemExit(res.returncode)
         elif args.send:
-            tmux_send(args.executor_target, prompt)
-            append_ledger(rd, "execute_send", "sent", iteration=iteration, target=args.executor_target)
+            send_tmux_prompt(run, rd, "execute_send", args.executor_target, prompt, iteration=iteration)
             if not args.tmux_wait_seconds:
                 run["awaiting"] = {"phase": "executor", "iteration": iteration, "target": args.executor_target, "prompt": str(prompt_path), "since": now_iso()}
                 write_json(rd / "RUN.json", run)
@@ -1474,8 +1712,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
                     review_text = res.stdout + ("\n\n## reviewer stderr\n```text\n" + res.stderr + "\n```\n" if res.stderr else "")
                 append_ledger(rd, "review_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode)
             elif args.send:
-                tmux_send(args.reviewer_target, review_prompt)
-                append_ledger(rd, "review_send", "sent", iteration=iteration, target=args.reviewer_target)
+                send_tmux_prompt(run, rd, "review_send", args.reviewer_target, review_prompt, iteration=iteration)
                 if not args.tmux_wait_seconds:
                     run["awaiting"] = {"phase": "reviewer", "iteration": iteration, "target": args.reviewer_target, "prompt": str(review_prompt_path), "since": now_iso()}
                     write_json(rd / "RUN.json", run)
@@ -1501,6 +1738,11 @@ def cmd_loop(args: argparse.Namespace) -> None:
         blockers = final_parsed.get("blockers", [])
         if not blockers and run.get("check", {}).get("verdict") != "FAIL":
             append_ledger(rd, "loop", "pass", iteration=iteration)
+            break
+        if blockers and is_review_infrastructure_blocker(blockers):
+            run["status"] = "review_blocked"
+            write_json(rd / "RUN.json", run)
+            append_ledger(rd, "loop", "review_incomplete", iteration=iteration, blocker_count=len(blockers))
             break
         if iteration >= args.max_iterations:
             run["status"] = "review_blocked"
@@ -1570,6 +1812,8 @@ def run_summary(root: Path) -> dict[str, Any]:
             "title": run.get("title"),
             "status": run.get("status"),
             "run_dir": str(rd),
+            "awaiting": run.get("awaiting"),
+            "send_error": run.get("send_error"),
             "check": run.get("check", {}),
             "review": run.get("review", {}),
             "recent_events": ledger_events,
@@ -1589,6 +1833,7 @@ Usage:
 
 CfC no longer opens an interactive TUI. It is meant to be called by Codex/OMX/GJC/other plugin adapters.
 Core loop: executor adapter -> git/check evidence -> independent reviewer adapter -> repair -> learn.
+Tracked config: `{TRACKED_CONFIG_FILE}` can define command-mode executor/reviewer profiles.
 """)
 
 
@@ -1600,26 +1845,35 @@ def known_commands() -> set[str]:
 
 
 def default_loop_namespace(request: str, root: str = ".", replace: bool = False, allow_dirty: bool = False) -> argparse.Namespace:
+    root_path_value = nearest_git_root(Path(root))
+    config = load_config(root_path_value if is_git_repo(root_path_value) else Path(root))
+    adapters = adapter_config(config)
+    mode = str(adapters.get("mode") or "tmux")
+    executor_command, executor_profile = configured_executor_command(config, request)
+    reviewer_command = configured_reviewer_command(config)
+    command_mode = mode == "command" or bool(executor_command or reviewer_command)
     return argparse.Namespace(
         root=root,
         request=request,
         allow=["*"],
         forbid=None,
-        verify=["git diff --check"],
-        max_iterations=int(os.environ.get("CFC_MAX_ITERATIONS", "3")),
-        executor_target=os.environ.get("CFC_EXECUTOR_TARGET", "gjc:0.0"),
-        reviewer_target=os.environ.get("CFC_REVIEWER_TARGET", "cfc-review:0.0"),
-        send=os.environ.get("CFC_SEND", "1") not in {"0", "false", "False", "no"},
-        tmux_wait_seconds=int(os.environ.get("CFC_TMUX_WAIT_SECONDS", "0")),
-        capture_lines=int(os.environ.get("CFC_CAPTURE_LINES", "5000")),
-        isolated_tmux=os.environ.get("CFC_ISOLATED_TMUX", "1") not in {"0", "false", "False", "no"},
-        executor_command=os.environ.get("CFC_EXECUTOR_COMMAND") or None,
-        reviewer_command=os.environ.get("CFC_REVIEWER_COMMAND") or None,
-        timeout=int(os.environ.get("CFC_TIMEOUT", "600")),
+        verify=config.get("verification", {}).get("commands") or ["git diff --check"],
+        max_iterations=int(config.get("loop", {}).get("max_iterations") or os.environ.get("CFC_MAX_ITERATIONS", "3")),
+        executor_target=str(adapters.get("executor_target") or adapters.get("executorTarget") or os.environ.get("CFC_EXECUTOR_TARGET", "gjc:0.0")),
+        reviewer_target=str(adapters.get("reviewer_target") or adapters.get("reviewerTarget") or os.environ.get("CFC_REVIEWER_TARGET", "cfc-review:0.0")),
+        send=False if command_mode else env_bool("CFC_SEND", True),
+        tmux_wait_seconds=int(adapters.get("tmux_wait_seconds") or adapters.get("tmuxWaitSeconds") or os.environ.get("CFC_TMUX_WAIT_SECONDS", "0")),
+        capture_lines=int(adapters.get("capture_lines") or adapters.get("captureLines") or os.environ.get("CFC_CAPTURE_LINES", "5000")),
+        isolated_tmux=bool(adapters.get("isolated_tmux", adapters.get("isolatedTmux", env_bool("CFC_ISOLATED_TMUX", True)))),
+        executor_command=executor_command or os.environ.get("CFC_EXECUTOR_COMMAND") or None,
+        reviewer_command=reviewer_command or os.environ.get("CFC_REVIEWER_COMMAND") or None,
+        executor_profile=executor_profile,
+        reviewer_profile=adapters.get("reviewer_profile") or adapters.get("reviewerProfile") or "codex",
+        timeout=int(adapters.get("timeout") or os.environ.get("CFC_TIMEOUT", "600")),
         allow_dirty=allow_dirty,
         replace=replace,
-        apply_learn=os.environ.get("CFC_APPLY_LEARN", "0") in {"1", "true", "True", "yes"},
-        review_on_check_fail=True,
+        apply_learn=env_bool("CFC_APPLY_LEARN", False),
+        review_on_check_fail=env_bool("CFC_REVIEW_ON_CHECK_FAIL", True),
     )
 
 
@@ -1662,16 +1916,21 @@ def cmd_plugin_manifest(args: argparse.Namespace) -> None:
         "version": VERSION,
         "description": "Headless recursive controller for Codex/OMX/GJC-style agent plugins.",
         "interface": "stdio-cli",
+        "config_file": TRACKED_CONFIG_FILE,
         "commands": {
             "run": "Start/replace a recursive loop for a task.",
             "status": "Return machine-readable repo/run status.",
             "events": "Return recent active-run ledger events.",
             "cancel": "Clear the active run pointer without deleting artifacts.",
         },
+        "config": {
+            "adapters": "Use adapters.mode=command plus executor_profile/reviewer_profile/profiles for cost-optimized model routing.",
+        },
         "env": [
             "CFC_EXECUTOR_COMMAND", "CFC_REVIEWER_COMMAND", "CFC_EXECUTOR_TARGET", "CFC_REVIEWER_TARGET",
             "CFC_SEND", "CFC_TMUX_WAIT_SECONDS", "CFC_MAX_ITERATIONS", "CFC_APPLY_LEARN", "CFC_ISOLATED_TMUX",
-            "CFC_DONE_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_POLL_SECONDS", "CFC_REVIEW_WAIT_TIMEOUT_SECONDS",
+            "CFC_DONE_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_ON_CHECK_FAIL",
+            "CFC_REVIEW_POLL_SECONDS", "CFC_REVIEW_WAIT_TIMEOUT_SECONDS",
         ],
     }
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
@@ -1702,6 +1961,8 @@ def cmd_plugin_cancel(args: argparse.Namespace) -> None:
     run, rd = active_run(root)
     run["status"] = "cancelled"
     run["completed_at"] = now_iso()
+    run["cancelled_at"] = run["completed_at"]
+    run.pop("awaiting", None)
     write_json(rd / "RUN.json", run)
     write_json(current_file(root), {"run_id": None, "last_run_id": run["id"], "updated_at": now_iso(), "cancelled": True})
     append_ledger(rd, "cancel", "cancelled")
@@ -1712,6 +1973,13 @@ def cmd_plugin_run(args: argparse.Namespace) -> None:
     root_path_value = resolve_plugin_root(args)
     root = str(root_path_value)
     ns = default_loop_namespace(args.request, root=root, replace=args.replace, allow_dirty=args.allow_dirty)
+    if getattr(args, "executor_profile", None):
+        ns.executor_profile = args.executor_profile
+        ns.executor_command = None
+    if getattr(args, "reviewer_profile", None):
+        ns.reviewer_profile = args.reviewer_profile
+        ns.reviewer_command = None
+    apply_configured_adapters(ns, root_path_value)
     if args.executor_command:
         ns.executor_command = args.executor_command
         ns.send = False
@@ -1730,6 +1998,8 @@ def cmd_plugin_run(args: argparse.Namespace) -> None:
         ns.send = False
     if args.max_iterations is not None:
         ns.max_iterations = args.max_iterations
+    if getattr(args, "no_review_on_check_fail", False):
+        ns.review_on_check_fail = False
     if args.verify:
         ns.verify = args.verify
     if args.allow:
@@ -1826,13 +2096,17 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tmux-wait-seconds", type=int, default=0)
     sp.add_argument("--capture-lines", type=int, default=5000)
     sp.add_argument("--isolated-tmux", action="store_true", help="Create dedicated executor/reviewer GJC tmux sessions for this run")
+    sp.add_argument("--executor-profile")
+    sp.add_argument("--reviewer-profile")
     sp.add_argument("--executor-command")
     sp.add_argument("--reviewer-command")
     sp.add_argument("--timeout", type=int, default=600)
     sp.add_argument("--allow-dirty", action="store_true")
     sp.add_argument("--replace", action="store_true")
     sp.add_argument("--apply-learn", action="store_true")
-    sp.add_argument("--review-on-check-fail", action="store_true", default=True)
+    review_fail = sp.add_mutually_exclusive_group()
+    review_fail.add_argument("--review-on-check-fail", dest="review_on_check_fail", action="store_true", default=True)
+    review_fail.add_argument("--no-review-on-check-fail", dest="review_on_check_fail", action="store_false")
     sp.set_defaults(func=cmd_loop)
 
     sp = sub.add_parser("park")
@@ -1881,11 +2155,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--executor-target")
     sp.add_argument("--reviewer-target")
     sp.add_argument("--isolated-tmux", action="store_true", help="Create dedicated executor/reviewer GJC tmux sessions for this run")
+    sp.add_argument("--executor-profile")
+    sp.add_argument("--reviewer-profile")
     sp.add_argument("--executor-command")
     sp.add_argument("--reviewer-command")
     sp.add_argument("--no-send", action="store_true")
     sp.add_argument("--allow-dirty", action="store_true")
     sp.add_argument("--replace", action="store_true")
+    sp.add_argument("--no-review-on-check-fail", action="store_true")
     sp.set_defaults(func=cmd_plugin_run)
 
     sp = sub.add_parser("events")
@@ -1916,9 +2193,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-
-
-
-
-

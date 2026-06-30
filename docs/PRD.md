@@ -63,8 +63,17 @@ cfc events
 
 - tmux mode: `--send --executor-target <tmux-pane> --reviewer-target <tmux-pane>`
 - command mode: `--executor-command <cmd> --reviewer-command <cmd>`
+- config mode: tracked `cfc.config.json` with `adapters.mode=command`,
+  `executor_profile`, `reviewer_profile`, and named `profiles`.
 
 The review evidence includes `git status`, unstaged diff, staged diff, and small text untracked files. Reviewer failure or empty reviewer output is treated as `REVIEW_BLOCKED`, never PASS.
+
+Default cost-optimized config uses open models only for execution and Codex for
+review:
+
+- `cheap`: Kimi K2.7 Code executor for localized implementation.
+- `complex`: GLM-5.2 executor for broad/async/state/security/migration work.
+- `codex`: read-only Codex reviewer and final verdict authority.
 
 ## Data Model
 
