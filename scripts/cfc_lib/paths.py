@@ -31,6 +31,20 @@ def runs_dir(root: Path) -> Path:
 def wiki_dir(root: Path) -> Path:
     return cfc_path(root) / "wiki"
 
+
+def global_cfc_path() -> Path:
+    explicit = os.environ.get("CFC_GLOBAL_DIR")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return Path.home() / CFC_DIR
+
+
+def global_wiki_dir() -> Path:
+    explicit = os.environ.get("CFC_GLOBAL_WIKI_DIR")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return global_cfc_path() / "wiki"
+
 def ensure_cfc(root: Path) -> None:
     if not cfc_path(root).exists():
         raise SystemExit(f"CfC is not initialized in {root}. Run: cfc init --root {shlex.quote(str(root))}")

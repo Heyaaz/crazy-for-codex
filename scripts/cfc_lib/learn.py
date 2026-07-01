@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import append_ledger, now_iso, sha256_text
-from .paths import root_path, wiki_dir
+from .paths import global_wiki_dir, root_path, wiki_dir
 from .review_result import parse_review_result
 from .state import active_run
 
@@ -68,7 +68,56 @@ def read_source_artifacts(rd: Path) -> tuple[str, str, list[dict[str, str]]]:
         review_chunks.append(text[:8000])
     return check, "\n\n".join(review_chunks), sources
 
-def run_learn(root: Path, run: dict[str, Any], rd: Path, apply: bool = False, auto_apply_high: bool = False) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+SENSITIVE_RE = re.compile(r"\b(secret|password|passwd|token|api[_ -]?key|credential|private[_ -]?key|endpoint|customer|client)\b", re.IGNORECASE)
+REPO_SPECIFIC_RE = re.compile(r"(?<![\w.-])(?:src|app|backend|frontend|tests?|packages?)/|(?:package\.json|pyproject\.toml|pom\.xml|build\.gradle)\b", re.IGNORECASE)
+GLOBAL_OPERATIONAL_RE = re.compile(
+    r"\b(cfc|codex|sandbox|tmux|gjc|reviewer|verification|evidence|receipt|prompt|diff|capture|allowed paths|forbidden|blocker|done\.md|scope)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_candidate_scope(candidate: dict[str, Any], run: dict[str, Any]) -> None:
+    text = "\n".join(str(candidate.get(key, "")) for key in ["title", "summary", "prevention", "prompt_patch"])
+    if SENSITIVE_RE.search(text):
+        candidate.update({
+            "scope": "never",
+            "confidence": "high",
+            "sensitivity": "sensitive",
+            "promotion_reason": "Contains sensitive operational terms and must not be promoted.",
+        })
+        return
+    if REPO_SPECIFIC_RE.search(text):
+        candidate.update({
+            "scope": "repo",
+            "confidence": "medium",
+            "sensitivity": "repo-specific",
+            "promotion_reason": "Mentions repo-shaped files or paths, so keep it local to this repository by default.",
+        })
+        return
+    if GLOBAL_OPERATIONAL_RE.search(text):
+        candidate.update({
+            "scope": "global",
+            "confidence": "high" if candidate.get("severity") == "high" else "medium",
+            "sensitivity": "safe",
+            "promotion_reason": "Describes reusable CFC/agent operating behavior rather than project-specific code.",
+        })
+        return
+    candidate.update({
+        "scope": "repo",
+        "confidence": "medium",
+        "sensitivity": "repo-specific",
+        "promotion_reason": "No reusable CFC operating signal was detected; keep it in the repo wiki.",
+    })
+
+
+def run_learn(
+    root: Path,
+    run: dict[str, Any],
+    rd: Path,
+    apply: bool = False,
+    auto_apply_high: bool = False,
+    promote_global: bool = False,
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     check, review_text, source_artifacts = read_source_artifacts(rd)
     candidates = derive_learn_candidates(run, check, review_text, injected_wiki_fragments(rd), source_artifacts)
     learn_md = render_learn(run, candidates)
@@ -76,20 +125,39 @@ def run_learn(root: Path, run: dict[str, Any], rd: Path, apply: bool = False, au
     append_ledger(rd, "learn", "suggested", candidate_count=len(candidates), path=str(rd / "LEARN.md"))
     applied: list[dict[str, Any]] = []
     if apply:
-        applied = candidates
+        applied.extend(apply_candidates(root, run, [c for c in candidates if c.get("scope") != "never"], target_scope="repo"))
     elif auto_apply_high:
-        applied = [c for c in candidates if c.get("severity") == "high"]
+        applied.extend(apply_candidates(root, run, [c for c in candidates if c.get("severity") == "high" and c.get("scope") != "never"], target_scope="repo"))
+    if promote_global:
+        applied.extend(apply_candidates(
+            root,
+            run,
+            [c for c in candidates if c.get("scope") == "global" and c.get("sensitivity") == "safe"],
+            target_scope="global",
+        ))
     if applied:
-        apply_candidates(root, run, applied)
-        append_ledger(rd, "learn_apply", "done", candidate_count=len(applied), mode="all" if apply else "high")
+        append_ledger(
+            rd,
+            "learn_apply",
+            "done",
+            candidate_count=len(applied),
+            repo_count=sum(1 for c in applied if c.get("applied_to") == "repo"),
+            global_count=sum(1 for c in applied if c.get("applied_to") == "global"),
+            mode="all" if apply else "high" if auto_apply_high else "global",
+        )
     return learn_md, candidates, applied
 
 def cmd_learn(args: argparse.Namespace) -> None:
     root = root_path(args)
     run, rd = active_run(root)
-    learn_md, _, applied = run_learn(root, run, rd, apply=args.apply)
+    learn_md, _, applied = run_learn(root, run, rd, apply=args.apply, promote_global=getattr(args, "promote_global", False))
     if applied:
-        print(f"Applied {len(applied)} learn candidate(s) to .cfc/wiki")
+        repo_count = sum(1 for c in applied if c.get("applied_to") == "repo")
+        global_count = sum(1 for c in applied if c.get("applied_to") == "global")
+        if repo_count:
+            print(f"Applied {repo_count} learn candidate(s) to .cfc/wiki")
+        if global_count:
+            print(f"Promoted {global_count} learn candidate(s) to global CFC wiki")
     print(learn_md)
 
 def derive_learn_candidates(
@@ -182,6 +250,7 @@ def derive_learn_candidates(
     for candidate in uniq:
         candidate["source_artifacts"] = list(source_artifacts or [])
         candidate["evidence_sha256"] = evidence_hash
+        classify_candidate_scope(candidate, run)
     return uniq[:3]
 
 def render_learn(run: dict[str, Any], candidates: list[dict[str, Any]]) -> str:
@@ -193,7 +262,12 @@ def render_learn(run: dict[str, Any], candidates: list[dict[str, Any]]) -> str:
 
 Title: {c['title']}
 Severity: {c['severity']}
+Scope: {c.get('scope', 'repo')}
+Confidence: {c.get('confidence', 'medium')}
+Sensitivity: {c.get('sensitivity', 'repo-specific')}
 Suggested slug: `{c['slug']}`
+
+Promotion reason: {c.get('promotion_reason', 'n/a')}
 
 ### Summary
 
@@ -231,25 +305,46 @@ def render_source_artifacts_md(artifacts: list[dict[str, str]]) -> str:
         return "- none"
     return "\n".join(f"- `{a.get('path')}` ({a.get('kind')}): `{a.get('sha256')}`" for a in artifacts)
 
-def apply_candidates(root: Path, run: dict[str, Any], candidates: list[dict[str, Any]]) -> None:
+def ensure_wiki_base(base: Path) -> None:
+    for sub in ["failures", "guardrails", "patterns", "runbooks", "checklists"]:
+        (base / sub).mkdir(parents=True, exist_ok=True)
+    index = base / "index.md"
+    if not index.exists():
+        index.write_text("# CfC Wiki\n\n- [Failures](failures/)\n- [Guardrails](guardrails/)\n- [Patterns](patterns/)\n- [Runbooks](runbooks/)\n- [Checklists](checklists/)\n", encoding="utf-8")
+    log = base / "log.md"
+    if not log.exists():
+        log.write_text("# CfC Wiki Log\n\n", encoding="utf-8")
+
+
+def apply_candidates(root: Path, run: dict[str, Any], candidates: list[dict[str, Any]], target_scope: str = "repo") -> list[dict[str, Any]]:
+    if not candidates:
+        return []
     type_to_dir = {"Failure": "failures", "Guardrail": "guardrails", "Runbook": "runbooks"}
+    base = wiki_dir(root) if target_scope == "repo" else global_wiki_dir()
+    ensure_wiki_base(base)
+    applied: list[dict[str, Any]] = []
     for c in candidates:
-        d = wiki_dir(root) / type_to_dir.get(c["type"], "patterns")
+        d = base / type_to_dir.get(c["type"], "patterns")
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{c['slug']}.md"
         if path.exists():
             continue
         tags = sorted({"cfc", "gjc", *re.findall(r"[a-z0-9][a-z0-9_-]*", (c["title"] + " " + run["title"]).lower())})
         source_artifacts = c.get("source_artifacts") or []
+        source_run = f"../runs/{run['id']}" if target_scope == "repo" else str(Path(run["repo"]) / ".cfc" / "runs" / run["id"])
         path.write_text(f"""---
 type: {c['type']}
 title: {c['title']}
 tags: [{", ".join(tags[:12])}]
 status: active
 severity: {c['severity']}
+scope: {c.get('scope', 'repo')}
+applied_scope: {target_scope}
+confidence: {c.get('confidence', 'medium')}
+sensitivity: {c.get('sensitivity', 'repo-specific')}
 created_at: {now_iso()}
 source_runs:
-  - ../runs/{run['id']}
+  - {source_run}
 evidence_sha256: {c.get('evidence_sha256', '')}
 {render_source_artifacts_yaml(source_artifacts)}
 ---
@@ -275,6 +370,11 @@ Source artifacts:
 
 Evidence SHA256: `{c.get('evidence_sha256', '')}`
 """, encoding="utf-8")
-    log = wiki_dir(root) / "log.md"
+        item = dict(c)
+        item["applied_to"] = target_scope
+        item["path"] = str(path)
+        applied.append(item)
+    log = base / "log.md"
     with log.open("a", encoding="utf-8") as f:
-        f.write(f"- {now_iso()} Applied {len(candidates)} learn candidates from `{run['id']}`.\n")
+        f.write(f"- {now_iso()} Applied {len(applied)} learn candidates from `{run['id']}` to {target_scope} wiki.\n")
+    return applied

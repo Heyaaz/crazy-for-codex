@@ -203,6 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("learn")
     add_root(sp)
     sp.add_argument("--apply", action="store_true")
+    sp.add_argument("--promote-global", action="store_true", help="Promote safe global-scope learn candidates to the global CFC wiki")
     sp.set_defaults(func=cmd_learn)
 
     sp = sub.add_parser("done")

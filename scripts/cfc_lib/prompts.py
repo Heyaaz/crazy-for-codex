@@ -118,6 +118,7 @@ def flatten_wiki_context(wiki: dict[str, list[tuple[str, str, dict[str, Any]]]])
             source_id = str(provenance.get("source_id") or sha256_text(f"{section}\n{title}\n{body}")[:16])
             items.append({
                 "source_id": source_id,
+                "scope": provenance.get("scope") or "repo",
                 "section": provenance.get("section") or section,
                 "path": provenance.get("path"),
                 "title": title,
@@ -133,13 +134,14 @@ def render_wiki_context(run: dict[str, Any], mode: str, items: list[dict[str, An
     if not items:
         parts.append("No wiki entries selected.")
         return "\n".join(parts) + "\n"
-    parts.append("| source_id | section | path | title | tags | score | reason |")
-    parts.append("| --- | --- | --- | --- | --- | ---: | --- |")
+    parts.append("| source_id | scope | section | path | title | tags | score | reason |")
+    parts.append("| --- | --- | --- | --- | --- | --- | ---: | --- |")
     for item in items:
         tags = ", ".join(item.get("tags") or [])
         parts.append(
-            "| `{source_id}` | {section} | `{path}` | {title} | {tags} | {score} | {reason} |".format(
+            "| `{source_id}` | {scope} | {section} | `{path}` | {title} | {tags} | {score} | {reason} |".format(
                 source_id=item.get("source_id", ""),
+                scope=item.get("scope", "repo"),
                 section=item.get("section", ""),
                 path=item.get("path") or "",
                 title=str(item.get("title") or "").replace("|", "\\|"),
@@ -186,16 +188,35 @@ def wiki_context_char_budget(run: dict[str, Any], user_request: str) -> int:
     return default_chars
 
 
+def global_wiki_context_char_budget(run: dict[str, Any]) -> int:
+    explicit = os.environ.get("CFC_GLOBAL_WIKI_CONTEXT_MAX_CHARS")
+    if explicit is not None:
+        try:
+            return max(0, int(explicit))
+        except ValueError:
+            return 800
+    budget_name = (run.get("budget") or {}).get("name") if isinstance(run.get("budget"), dict) else None
+    name = str(budget_name or os.environ.get("CFC_BUDGET") or DEFAULT_BUDGET)
+    if name == "strict":
+        return 1500
+    if name == "light":
+        return 500
+    return 800
+
+
 def budget_wiki_context(
     rd: Path,
     wiki: dict[str, list[tuple[str, str, dict[str, Any]]]],
     max_chars: int,
+    global_max_chars: int | None = None,
 ) -> tuple[dict[str, list[tuple[str, str, dict[str, Any]]]], dict[str, Any]]:
     seen = prior_prompt_wiki_sources(rd)
     out: dict[str, list[tuple[str, str, dict[str, Any]]]] = {key: [] for key in wiki}
     used = 0
+    used_global = 0
     skipped_seen: list[str] = []
     skipped_budget: list[str] = []
+    skipped_global_budget: list[str] = []
     truncated: list[str] = []
     for section, entries in wiki.items():
         for title, body, provenance in entries:
@@ -205,23 +226,37 @@ def budget_wiki_context(
                 continue
             fixed_cost = len(title) + len(str(provenance.get("path") or "")) + 120
             remaining = max_chars - used - fixed_cost
+            is_global = provenance.get("scope") == "global"
+            if is_global and global_max_chars is not None:
+                remaining = min(remaining, global_max_chars - used_global - fixed_cost)
             if remaining <= 0:
-                skipped_budget.append(source_id)
+                if is_global:
+                    skipped_global_budget.append(source_id)
+                else:
+                    skipped_budget.append(source_id)
                 continue
             next_body = body
             if len(next_body) > remaining:
                 if remaining < 160:
-                    skipped_budget.append(source_id)
+                    if is_global:
+                        skipped_global_budget.append(source_id)
+                    else:
+                        skipped_budget.append(source_id)
                     continue
                 next_body = next_body[:remaining].rstrip() + "\n...[truncated by CFC wiki budget]"
                 truncated.append(source_id)
             used += fixed_cost + len(next_body)
+            if is_global:
+                used_global += fixed_cost + len(next_body)
             out[section].append((title, next_body, provenance))
     return out, {
         "max_chars": max_chars,
         "used_chars": used,
+        "global_max_chars": global_max_chars,
+        "used_global_chars": used_global,
         "skipped_already_in_transcript": skipped_seen,
         "skipped_by_budget": skipped_budget,
+        "skipped_global_by_budget": skipped_global_budget,
         "truncated_by_budget": truncated,
     }
 
@@ -254,7 +289,12 @@ def build_prompt(run: dict[str, Any], root: Path, user_request: str, mode: str =
     ])
     wiki = collect_active_wiki(root, task_text=wiki_context)
     rd = runs_dir(root) / run["id"]
-    wiki, wiki_budget = budget_wiki_context(rd, wiki, wiki_context_char_budget(run, user_request))
+    wiki, wiki_budget = budget_wiki_context(
+        rd,
+        wiki,
+        wiki_context_char_budget(run, user_request),
+        global_wiki_context_char_budget(run),
+    )
     record_wiki_context(run, root, mode, wiki, wiki_budget)
     sections: list[str] = []
     sections.append(f"# CfC {mode.title()} Prompt")
@@ -296,7 +336,7 @@ def build_prompt(run: dict[str, Any], root: Path, user_request: str, mode: str =
                 source_id = str(provenance.get("source_id") or sha256_text(f"{key}\n{title}\n{body}")[:16])
                 sections.append(f"<!-- CFC:WIKI-SOURCE {source_id} BEGIN -->")
                 sections.append(
-                    f"- Source `{source_id}` ({provenance.get('path', key)}; reason: {provenance.get('reason', 'n/a')})\n"
+                    f"- Source `{source_id}` ({provenance.get('scope', 'repo')}:{provenance.get('path', key)}; reason: {provenance.get('reason', 'n/a')})\n"
                     f"  Title: {title}\n"
                     "  Quoted wiki data (untrusted):\n"
                     f"{indent_block(body, '  ')}"

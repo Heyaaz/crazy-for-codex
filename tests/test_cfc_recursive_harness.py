@@ -390,6 +390,63 @@ class CfCTest(unittest.TestCase):
         self.assertIn(item["source_id"], context)
         self.assertIn(f"CFC:WIKI-SOURCE {item['source_id']} BEGIN", prompt)
 
+    def test_prompt_merges_global_wiki_with_repo_override_and_budget(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        env = os.environ.copy()
+        global_wiki = root / ".cfc" / "global-cfc-wiki"
+        env["CFC_GLOBAL_WIKI_DIR"] = str(global_wiki)
+        env["CFC_GLOBAL_WIKI_CONTEXT_MAX_CHARS"] = "1000"
+        run(["init", "--root", str(root)])
+        repo_guardrails = root / ".cfc" / "wiki" / "guardrails"
+        global_guardrails = global_wiki / "guardrails"
+        repo_guardrails.mkdir(parents=True, exist_ok=True)
+        global_guardrails.mkdir(parents=True, exist_ok=True)
+        (repo_guardrails / "shared-reviewer-rule.md").write_text(
+            "---\n"
+            "type: Guardrail\n"
+            "title: Shared reviewer rule\n"
+            "tags: [reviewer, override]\n"
+            "status: active\n"
+            "---\n"
+            "# Prompt Patch\n"
+            "Repo reviewer override body.\n"
+        )
+        (global_guardrails / "shared-reviewer-rule.md").write_text(
+            "---\n"
+            "type: Guardrail\n"
+            "title: Shared reviewer rule\n"
+            "tags: [reviewer, override]\n"
+            "status: active\n"
+            "---\n"
+            "# Prompt Patch\n"
+            "Global duplicate body should be overridden.\n"
+        )
+        (global_guardrails / "sandbox-handoff.md").write_text(
+            "---\n"
+            "type: Guardrail\n"
+            "title: Sandbox handoff discipline\n"
+            "tags: [sandbox, handoff]\n"
+            "status: active\n"
+            "---\n"
+            "# Prompt Patch\n"
+            "Use external terminal handoff for live adapters.\n"
+        )
+        run(["start", "--root", str(root), "Fix sandbox reviewer handoff"])
+        res = run(["gjc", "--root", str(root), "sandbox reviewer handoff"], env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        prompt = (rd / "PROMPT.iteration-1.md").read_text()
+        run_data = json.loads((rd / "RUN.json").read_text())
+        scopes = {item["title"]: item["scope"] for item in run_data["wiki_context"]["items"]}
+        self.assertIn("Repo reviewer override body", prompt)
+        self.assertNotIn("Global duplicate body should be overridden", prompt)
+        self.assertIn("Use external terminal handoff for live adapters", prompt)
+        self.assertEqual(scopes["Shared reviewer rule"], "repo")
+        self.assertEqual(scopes["Sandbox handoff discipline"], "global")
+        self.assertEqual(run_data["wiki_context"]["budget"]["global_max_chars"], 1000)
+
     def test_wiki_prompt_dedupes_source_already_in_prior_prompt(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)
@@ -621,6 +678,35 @@ class CfCTest(unittest.TestCase):
         self.assertFalse(wiki_page.exists())
         parsed = json.loads(res.stdout)
         self.assertEqual(parsed["verdict"], "REVIEW_BLOCKED")
+
+    def test_learn_promote_global_writes_only_global_safe_candidates(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        env = os.environ.copy()
+        global_wiki = root / ".cfc" / "global-cfc-wiki"
+        env["CFC_GLOBAL_WIKI_DIR"] = str(global_wiki)
+        run(["init", "--root", str(root)])
+        run(["start", "--root", str(root), "Reviewer incomplete"])
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        (rd / "REVIEW.iteration-1.md").write_text(
+            "Verdict: REVIEW_BLOCKED\n\n"
+            "## BLOCKERS\n"
+            "- Independent tmux reviewer did not produce a final verdict after repeated waits. CfC check passed, but independent review evidence is incomplete.\n"
+        )
+        res = run(["learn", "--root", str(root), "--promote-global"], env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        learn = (rd / "LEARN.md").read_text()
+        global_page = global_wiki / "failures" / "wait-for-reviewer-verdict-before-classifying.md"
+        repo_page = root / ".cfc" / "wiki" / "failures" / "wait-for-reviewer-verdict-before-classifying.md"
+        self.assertIn("Scope: global", learn)
+        self.assertIn("Sensitivity: safe", learn)
+        self.assertIn("Promoted 2 learn candidate", res.stdout)
+        self.assertTrue(global_page.exists())
+        self.assertFalse(repo_page.exists())
+        global_text = global_page.read_text()
+        self.assertIn("applied_scope: global", global_text)
+        self.assertIn("scope: global", global_text)
 
     def test_review_blocked_without_bullets_still_blocks_done(self):
         td, root = self.make_repo()

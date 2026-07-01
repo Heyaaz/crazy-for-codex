@@ -102,6 +102,7 @@ def cmd_plugin_manifest(args: argparse.Namespace) -> None:
             "CFC_BUDGET", "CFC_CAPTURE_LINES", "CFC_WIKI_CONTEXT_MAX_CHARS", "CFC_REVIEW_RISK_GATE",
             "CFC_REVIEW_DIFF_MAX_CHARS", "CFC_REVIEW_UNTRACKED_FILE_MAX_CHARS",
             "CFC_EXECUTION_EXCERPT_MAX_CHARS", "CFC_EXECUTION_EXCERPT_TAIL_LINES",
+            "CFC_GLOBAL_DIR", "CFC_GLOBAL_WIKI_DIR", "CFC_GLOBAL_WIKI_CONTEXT_MAX_CHARS",
         ],
     }
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
