@@ -111,6 +111,7 @@ cost-optimized command-mode default:
 
 - executor profile `auto`
   - all executor tasks -> `glm` -> `gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}`
+  - isolated tmux executor sessions -> `gjc --model opencode-go/glm-5.2`
   - GLM command failure (quota/rate/auth/timeout/nonzero exit) -> `codex-executor` fallback
 - reviewer profile `codex` -> `codex exec --sandbox read-only -`
 - optional executor profile `gjc-rpc` -> `gjc --mode rpc` using JSONL stdio frames
@@ -165,6 +166,8 @@ CFC_MAX_ITERATIONS        default: 3
 CFC_APPLY_LEARN           default: 0
 CFC_ISOLATED_TMUX         default: 1
 CFC_KEEP_ISOLATED_TMUX    default: 0 (debug only; normally isolated sessions are cleaned on terminal run states)
+CFC_EXECUTOR_TMUX_COMMAND default: selected executor profile tmux_command, e.g. gjc --model opencode-go/glm-5.2
+CFC_REVIEWER_TMUX_COMMAND default: gjc
 CFC_REVIEW_POLL_SECONDS   default: 5
 CFC_REVIEW_WAIT_TIMEOUT_SECONDS default: 300 (pass 0 to wait indefinitely)
 ```

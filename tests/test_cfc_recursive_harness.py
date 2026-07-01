@@ -948,6 +948,7 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(profiles["glm"]["model"], "opencode-go/glm-5.2")
         self.assertIn("gjc -p --model opencode-go/glm-5.2", profiles["glm"]["command"])
         self.assertIn("@{prompt_file}", profiles["glm"]["command"])
+        self.assertEqual(profiles["glm"]["tmux_command"], "gjc --model opencode-go/glm-5.2")
         self.assertEqual(profiles["codex-executor"]["provider"], "codex")
         self.assertIn("codex exec --dangerously-bypass-approvals-and-sandbox -", profiles["codex-executor"]["command"])
         self.assertEqual(profiles["gjc-rpc"]["provider"], "gjc")
@@ -1057,6 +1058,7 @@ class CfCTest(unittest.TestCase):
         self.assertIn("CFC_AMBIENT_CONTEXT", manifest["env"])
         self.assertIn("CFC_AMBIENT_LEARN", manifest["env"])
         self.assertIn("CFC_KEEP_ISOLATED_TMUX", manifest["env"])
+        self.assertIn("CFC_EXECUTOR_TMUX_COMMAND", manifest["env"])
 
     def test_hook_user_prompt_submit_strict_only_for_cfc_keyword(self):
         td, root = self.make_repo()
@@ -1986,8 +1988,8 @@ class CfCTest(unittest.TestCase):
         sessions = []
         killed = []
 
-        def fake_ensure(session, session_root, title):
-            sessions.append(session)
+        def fake_ensure(session, session_root, title, command="gjc"):
+            sessions.append((session, command))
             return f"{session}:0.0"
 
         def fake_kill(session):
@@ -2004,7 +2006,9 @@ class CfCTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 module.cmd_loop(ns)
 
-        self.assertEqual(killed, sessions)
+        self.assertEqual(killed, [session for session, _ in sessions])
+        self.assertIn("opencode-go/glm-5.2", sessions[0][1])
+        self.assertEqual(sessions[1][1], "gjc")
         cur = json.loads((root / ".cfc" / "current.json").read_text())
         rd = root / ".cfc" / "runs" / cur["run_id"]
         run_data = json.loads((rd / "RUN.json").read_text())
@@ -2072,8 +2076,8 @@ class CfCTest(unittest.TestCase):
         sends = []
         sessions = []
 
-        def fake_ensure(session, session_root, title):
-            sessions.append((session, session_root, title))
+        def fake_ensure(session, session_root, title, command="gjc"):
+            sessions.append((session, session_root, title, command))
             return f"{session}:0.0"
 
         def fake_send(target, text):
@@ -2092,6 +2096,8 @@ class CfCTest(unittest.TestCase):
         self.assertTrue(sessions[0][0].startswith("cfc-"))
         self.assertTrue(sessions[0][0].endswith("-exec"))
         self.assertTrue(sessions[1][0].endswith("-review"))
+        self.assertIn("opencode-go/glm-5.2", sessions[0][3])
+        self.assertEqual(sessions[1][3], "gjc")
         self.assertEqual(len(sends), 1)
         self.assertEqual(sends[0][0], f"{sessions[0][0]}:0.0")
         cur = json.loads((root / ".cfc" / "current.json").read_text())
@@ -2100,6 +2106,7 @@ class CfCTest(unittest.TestCase):
         self.assertTrue(run_data["runner"].get("isolated_tmux"))
         self.assertEqual(run_data["runner"].get("target"), f"{sessions[0][0]}:0.0")
         self.assertEqual(run_data["runner"].get("reviewer_target"), f"{sessions[1][0]}:0.0")
+        self.assertIn("opencode-go/glm-5.2", run_data["runner"].get("executor_tmux_command"))
 
     def test_review_without_required_verdict_is_blocked(self):
         td, root = self.make_repo()

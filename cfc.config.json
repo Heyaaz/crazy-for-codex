@@ -9,6 +9,7 @@
         "provider": "opencode-go",
         "model": "opencode-go/glm-5.2",
         "command": "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}",
+        "tmux_command": "gjc --model opencode-go/glm-5.2",
         "purpose": "Default GJC executor using OpenCode Go GLM 5.2 for implementation and blocker repair tasks."
       },
       "codex-executor": {

@@ -102,6 +102,12 @@ def external_terminal_command(root: Path, args: argparse.Namespace) -> str:
         parts.extend(["--executor-profile", shlex.quote(str(args.executor_profile))])
     if getattr(args, "reviewer_profile", None):
         parts.extend(["--reviewer-profile", shlex.quote(str(args.reviewer_profile))])
+    if getattr(args, "isolated_tmux", False):
+        parts.append("--isolated-tmux")
+    if getattr(args, "executor_tmux_command", None):
+        parts.extend(["--executor-tmux-command", shlex.quote(str(args.executor_tmux_command))])
+    if getattr(args, "reviewer_tmux_command", None):
+        parts.extend(["--reviewer-tmux-command", shlex.quote(str(args.reviewer_tmux_command))])
     if getattr(args, "review_on_check_fail", True) is False:
         parts.append("--no-review-on-check-fail")
     if getattr(args, "review_risk_gate", None) is True:

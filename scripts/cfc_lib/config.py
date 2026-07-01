@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .common import deep_merge, read_json
-from .constants import TRACKED_CONFIG_FILE
+from .constants import DEFAULT_GLM_EXECUTOR_TMUX_COMMAND, TRACKED_CONFIG_FILE
 from .paths import cfc_path
 
 def load_config(root: Path) -> dict[str, Any]:
@@ -51,6 +51,21 @@ def configured_profile_command(config: dict[str, Any], profile: str | None) -> s
     if isinstance(value, dict):
         command = value.get("command")
         return str(command) if command else None
+    return None
+
+def configured_profile_tmux_command(config: dict[str, Any], profile: str | None) -> str | None:
+    if not profile:
+        return None
+    profiles = adapter_profiles(config)
+    value = profiles.get(profile)
+    if isinstance(value, dict):
+        command = value.get("tmux_command") or value.get("tmuxCommand") or value.get("interactive_command") or value.get("interactiveCommand")
+        if command:
+            return str(command)
+        provider = str(value.get("provider") or "")
+        model = value.get("model")
+        if provider in {"opencode-go", "gjc"} and model:
+            return f"gjc --model {shlex.quote(str(model))}"
     return None
 
 def configured_executor_fallbacks(config: dict[str, Any], profile: str | None) -> list[dict[str, str]]:
@@ -110,6 +125,22 @@ def configured_reviewer_command(config: dict[str, Any], profile: str | None = No
     adapters = adapter_config(config)
     profile_name = profile or adapters.get("reviewer_profile") or adapters.get("reviewerProfile") or "codex"
     return configured_profile_command(config, str(profile_name)) or configured_profile_command(config, "codex-reviewer")
+
+def configured_executor_tmux_command(config: dict[str, Any], request: str, profile: str | None = None) -> str:
+    adapters = adapter_config(config)
+    explicit = adapters.get("executor_tmux_command") or adapters.get("executorTmuxCommand")
+    if explicit:
+        return str(explicit)
+    selected = select_executor_profile(request, config, profile)
+    return configured_profile_tmux_command(config, selected) or DEFAULT_GLM_EXECUTOR_TMUX_COMMAND
+
+def configured_reviewer_tmux_command(config: dict[str, Any], profile: str | None = None) -> str:
+    adapters = adapter_config(config)
+    explicit = adapters.get("reviewer_tmux_command") or adapters.get("reviewerTmuxCommand")
+    if explicit:
+        return str(explicit)
+    command = configured_profile_tmux_command(config, profile or adapters.get("reviewer_profile") or adapters.get("reviewerProfile"))
+    return command or "gjc"
 
 def request_looks_complex(request: str, config: dict[str, Any]) -> bool:
     adapters = adapter_config(config)

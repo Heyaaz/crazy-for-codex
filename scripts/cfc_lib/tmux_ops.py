@@ -102,21 +102,29 @@ def short_run_token(run_id: str) -> str:
 def tmux_has_session(session: str) -> bool:
     return subprocess.run(["tmux", "has-session", "-t", session], stdout=subprocess.PIPE, stderr=subprocess.PIPE).returncode == 0
 
-def ensure_gjc_tmux_session(session: str, root: Path, title: str) -> str:
+def ensure_gjc_tmux_session(session: str, root: Path, title: str, command: str = "gjc") -> str:
     if not tmux_has_session(session):
-        subprocess.run(["tmux", "new-session", "-d", "-s", session, "-c", str(root), "gjc"], check=True)
+        subprocess.run(["tmux", "new-session", "-d", "-s", session, "-c", str(root), command], check=True)
         subprocess.run(["tmux", "rename-window", "-t", f"{session}:0", title], check=False)
     return f"{session}:0.0"
 
-def ensure_isolated_tmux_targets(root: Path, run: dict[str, Any], rd: Path) -> tuple[str, str]:
+def ensure_isolated_tmux_targets(
+    root: Path,
+    run: dict[str, Any],
+    rd: Path,
+    executor_command: str = "gjc",
+    reviewer_command: str = "gjc",
+) -> tuple[str, str]:
     token = short_run_token(run["id"])
     executor_session = f"cfc-{token}-exec"
     reviewer_session = f"cfc-{token}-review"
-    executor_target = ensure_gjc_tmux_session(executor_session, root, "CFC executor")
-    reviewer_target = ensure_gjc_tmux_session(reviewer_session, root, "CFC reviewer")
+    executor_target = ensure_gjc_tmux_session(executor_session, root, "CFC executor", executor_command)
+    reviewer_target = ensure_gjc_tmux_session(reviewer_session, root, "CFC reviewer", reviewer_command)
     run.setdefault("runner", {})["isolated_tmux"] = True
     run["runner"]["executor_session"] = executor_session
     run["runner"]["reviewer_session"] = reviewer_session
+    run["runner"]["executor_tmux_command"] = executor_command
+    run["runner"]["reviewer_tmux_command"] = reviewer_command
     run["runner"]["target"] = executor_target
     run["runner"]["reviewer_target"] = reviewer_target
     write_json(rd / "RUN.json", run)

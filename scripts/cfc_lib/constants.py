@@ -29,6 +29,7 @@ DEFAULT_IGNORED_STATUS_PATTERNS = [
 TRUE_STRINGS = {"1", "true", "True", "yes", "on"}
 FALSE_STRINGS = {"0", "false", "False", "no", "off"}
 DEFAULT_GLM_EXECUTOR_COMMAND = "gjc -p --model opencode-go/glm-5.2 --no-session @{prompt_file}"
+DEFAULT_GLM_EXECUTOR_TMUX_COMMAND = "gjc --model opencode-go/glm-5.2"
 DEFAULT_CODEX_EXECUTOR_COMMAND = "codex exec --dangerously-bypass-approvals-and-sandbox -"
 DEFAULT_CHEAP_EXECUTOR_COMMAND = DEFAULT_GLM_EXECUTOR_COMMAND
 DEFAULT_COMPLEX_EXECUTOR_COMMAND = DEFAULT_GLM_EXECUTOR_COMMAND

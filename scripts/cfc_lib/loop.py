@@ -17,7 +17,16 @@ from typing import Any
 from .budget import budget_capture_lines, budget_name, budget_review_risk_gate, render_risk_gated_review, review_risk_gate_reason
 from .commands_core import cmd_check, cmd_diff, cmd_done, cmd_init, cmd_start
 from .common import append_ledger, env_bool, now_iso, sha256_text, write_json
-from .config import adapter_config, apply_configured_adapters, configured_executor_command, configured_executor_fallbacks, configured_reviewer_command, load_config
+from .config import (
+    adapter_config,
+    apply_configured_adapters,
+    configured_executor_command,
+    configured_executor_fallbacks,
+    configured_executor_tmux_command,
+    configured_reviewer_command,
+    configured_reviewer_tmux_command,
+    load_config,
+)
 from .git_ops import is_git_repo, nearest_git_root
 from .learn import cmd_learn
 from .paths import cfc_path, root_path
@@ -335,6 +344,11 @@ def cmd_loop(args: argparse.Namespace) -> None:
     if getattr(args, "review_risk_gate", None) is None:
         args.review_risk_gate = budget_review_risk_gate(args.budget, config)
     apply_configured_adapters(args, root)
+    if getattr(args, "send", False):
+        if not getattr(args, "executor_tmux_command", None):
+            args.executor_tmux_command = os.environ.get("CFC_EXECUTOR_TMUX_COMMAND") or configured_executor_tmux_command(config, args.request, getattr(args, "executor_profile", None))
+        if not getattr(args, "reviewer_tmux_command", None):
+            args.reviewer_tmux_command = os.environ.get("CFC_REVIEWER_TMUX_COMMAND") or configured_reviewer_tmux_command(config, getattr(args, "reviewer_profile", None))
     if not args.executor_command and not args.send:
         raise SystemExit("cfc loop requires an executor adapter: pass --executor-command or use --send with --executor-target")
     if not args.reviewer_command and not args.send:
@@ -350,7 +364,15 @@ def cmd_loop(args: argparse.Namespace) -> None:
     cmd_start(start_args)
     run, rd = active_run(root)
     if args.send and getattr(args, "isolated_tmux", False):
-        args.executor_target, args.reviewer_target = ensure_isolated_tmux_targets(root, run, rd)
+        executor_tmux_command = getattr(args, "executor_tmux_command", None) or os.environ.get("CFC_EXECUTOR_TMUX_COMMAND")
+        reviewer_tmux_command = getattr(args, "reviewer_tmux_command", None) or os.environ.get("CFC_REVIEWER_TMUX_COMMAND")
+        args.executor_target, args.reviewer_target = ensure_isolated_tmux_targets(
+            root,
+            run,
+            rd,
+            executor_command=executor_tmux_command or "gjc",
+            reviewer_command=reviewer_tmux_command or "gjc",
+        )
         run, rd = active_run(root)
     run.setdefault("loop", {})["max_iterations"] = args.max_iterations
     run["loop"]["review_on_check_fail"] = bool(args.review_on_check_fail)
@@ -503,6 +525,8 @@ def default_loop_namespace(request: str, root: str = ".", replace: bool = False,
         tmux_wait_seconds=int(adapters.get("tmux_wait_seconds") or adapters.get("tmuxWaitSeconds") or os.environ.get("CFC_TMUX_WAIT_SECONDS", "0")),
         capture_lines=int(configured_capture_lines) if configured_capture_lines else budget_capture_lines(selected_budget, config),
         isolated_tmux=bool(adapters.get("isolated_tmux", adapters.get("isolatedTmux", env_bool("CFC_ISOLATED_TMUX", True)))),
+        executor_tmux_command=os.environ.get("CFC_EXECUTOR_TMUX_COMMAND") or configured_executor_tmux_command(config, request, executor_profile),
+        reviewer_tmux_command=os.environ.get("CFC_REVIEWER_TMUX_COMMAND") or configured_reviewer_tmux_command(config),
         executor_command=executor_command or os.environ.get("CFC_EXECUTOR_COMMAND") or None,
         executor_fallbacks=executor_fallbacks,
         reviewer_command=reviewer_command or os.environ.get("CFC_REVIEWER_COMMAND") or None,

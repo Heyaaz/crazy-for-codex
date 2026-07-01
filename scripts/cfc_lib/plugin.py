@@ -98,7 +98,7 @@ def cmd_plugin_manifest(args: argparse.Namespace) -> None:
         "env": [
             "CFC_EXECUTOR_COMMAND", "CFC_REVIEWER_COMMAND", "CFC_EXECUTOR_TARGET", "CFC_REVIEWER_TARGET",
             "CFC_SEND", "CFC_TMUX_WAIT_SECONDS", "CFC_MAX_ITERATIONS", "CFC_APPLY_LEARN", "CFC_ISOLATED_TMUX",
-            "CFC_KEEP_ISOLATED_TMUX",
+            "CFC_KEEP_ISOLATED_TMUX", "CFC_EXECUTOR_TMUX_COMMAND", "CFC_REVIEWER_TMUX_COMMAND",
             "CFC_DONE_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_ON_CHECK_FAIL",
             "CFC_REVIEW_POLL_SECONDS", "CFC_REVIEW_WAIT_TIMEOUT_SECONDS", "CFC_ALLOW_SANDBOX_LIVE_ADAPTERS",
             "CFC_BUDGET", "CFC_CAPTURE_LINES", "CFC_WIKI_CONTEXT_MAX_CHARS", "CFC_REVIEW_RISK_GATE",
@@ -169,6 +169,10 @@ def cmd_plugin_run(args: argparse.Namespace) -> None:
         ns.isolated_tmux = False
     if getattr(args, "isolated_tmux", False):
         ns.isolated_tmux = True
+    if getattr(args, "executor_tmux_command", None):
+        ns.executor_tmux_command = args.executor_tmux_command
+    if getattr(args, "reviewer_tmux_command", None):
+        ns.reviewer_tmux_command = args.reviewer_tmux_command
     if args.no_send:
         ns.send = False
     if args.max_iterations is not None:
