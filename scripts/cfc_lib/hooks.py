@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .ambient import apply_ambient_global_learn, build_ambient_global_context
 from .common import read_json
 from .evidence import RECEIPT_RE, validate_receipt
 from .git_ops import git_changed_files
@@ -128,13 +129,44 @@ def build_user_prompt_submit_payload(root: Path, raw: str) -> dict[str, Any]:
             ),
             "active_run": run.get("id"),
         }
+    ambient = build_ambient_global_context(root, prompt)
+    if ambient.get("injection"):
+        return {
+            "hook": "UserPromptSubmit",
+            "mode": "light",
+            "block": False,
+            "reason": "ambient_global_context",
+            "injection": ambient["injection"],
+            "active_run": None,
+            "ambient_context": {
+                "item_count": len(ambient.get("items") or []),
+                "items": ambient.get("items") or [],
+                "budget": ambient.get("budget") or {},
+            },
+        }
     return {"hook": "UserPromptSubmit", "mode": "light", "block": False, "reason": "no_cfc_keyword", "injection": "", "active_run": None}
 
 
-def stop_guard_payload(root: Path) -> dict[str, Any]:
+def stop_guard_payload(root: Path, raw: str = "") -> dict[str, Any]:
     active = _active(root)
     if not active:
-        return {"hook": "Stop", "mode": "light", "block": False, "reason": "no_active_run", "blockers": []}
+        ambient = apply_ambient_global_learn(root, raw)
+        return {
+            "hook": "Stop",
+            "mode": "light",
+            "block": False,
+            "reason": "no_active_run",
+            "blockers": [],
+            "ambient_learn": {
+                "enabled": ambient.get("enabled", False),
+                "candidate_count": ambient.get("candidate_count", 0),
+                "applied_count": ambient.get("applied_count", 0),
+                "applied": [
+                    {"title": item.get("title"), "path": item.get("path"), "scope": item.get("scope")}
+                    for item in ambient.get("applied", [])
+                ],
+            },
+        }
     run, rd = active
     blockers: list[str] = []
     if run.get("awaiting"):
@@ -227,7 +259,7 @@ def cmd_hook_user_prompt_submit(args: argparse.Namespace) -> None:
 
 
 def cmd_hook_stop(args: argparse.Namespace) -> None:
-    payload = stop_guard_payload(root_path(args))
+    payload = stop_guard_payload(root_path(args), _read_stdin())
     _emit(payload, args.json)
     raise SystemExit(_exit_code(payload))
 

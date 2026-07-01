@@ -75,8 +75,9 @@ cfc hook subagent-stop --root /path/to/repo
 
 Policy:
 
-- No explicit CFC keyword -> light mode. The router hook normally emits no
-  context and does not force a CFC run.
+- No explicit CFC keyword -> light mode. The router hook never starts a CFC
+  run. If safe global CFC memory is relevant, it may emit a small untrusted
+  context block for normal Codex/OMX use.
 - Explicit `cfc` / `$cfc` / `cfc 로` / `cfc 돌려` style prompt -> strict router
   context. The next agent turn must start with `cfc plugin status` and may not
   perform direct repo work before CFC accepts or refuses.
@@ -85,6 +86,9 @@ Policy:
   handoff and tells the agent not to run `cfc plugin run` directly in the app.
 - Active CFC run -> stop guard blocks unresolved exits until the run has check,
   review, and DONE evidence, or the run is explicitly cancelled.
+- No active CFC run at stop -> ambient learn may promote explicit safe
+  `remember:` / `learn:` style operational guidance into the global CFC wiki.
+  Sensitive, repo-specific, and low-signal text is ignored.
 - Evidence receipt guard blocks subagent stop only when the active run requires
   receipts or the hook is invoked with `--strict`.
 
@@ -160,6 +164,7 @@ CFC_TMUX_WAIT_SECONDS     default: 0
 CFC_MAX_ITERATIONS        default: 3
 CFC_APPLY_LEARN           default: 0
 CFC_ISOLATED_TMUX         default: 1
+CFC_KEEP_ISOLATED_TMUX    default: 0 (debug only; normally isolated sessions are cleaned on terminal run states)
 CFC_REVIEW_POLL_SECONDS   default: 5
 CFC_REVIEW_WAIT_TIMEOUT_SECONDS default: 300 (pass 0 to wait indefinitely)
 ```
@@ -266,6 +271,13 @@ Prompt-time wiki injection is bounded and de-duplicated. CfC records injected
 source ids in `WIKI_CONTEXT.md` / `RUN.json`, skips wiki blocks already present
 in prior executor/repair prompts for the same run, and caps total wiki body
 text with `CFC_WIKI_CONTEXT_MAX_CHARS` or the built-in prompt-pressure budget.
+
+Normal Codex/OMX ambient memory is intentionally lighter than the recursive
+loop. `cfc hook user-prompt-submit` can inject only a bounded global CFC wiki
+excerpt for relevant non-CFC prompts (`CFC_AMBIENT_CONTEXT_MAX_CHARS`, default
+900). `cfc hook stop` can promote explicit safe ambient learn signals to the
+global CFC wiki (`CFC_AMBIENT_LEARN=0` disables this). Neither path starts
+executor/reviewer adapters.
 
 ## Manual primitives
 

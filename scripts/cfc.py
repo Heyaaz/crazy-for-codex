@@ -31,13 +31,16 @@ def _sync_compat_hooks() -> None:
     _tmux_ops.wait_for_tmux_verdict = globals()["wait_for_tmux_verdict"]
     _tmux_ops.ensure_gjc_tmux_session = globals()["ensure_gjc_tmux_session"]
     _tmux_ops.ensure_isolated_tmux_targets = globals()["ensure_isolated_tmux_targets"]
+    _tmux_ops.tmux_kill_session = globals()["tmux_kill_session"]
 
     _loop.tmux_capture = globals()["tmux_capture"]
     _loop.wait_for_tmux_verdict = globals()["wait_for_tmux_verdict"]
     _loop.send_tmux_prompt = globals()["send_tmux_prompt"]
     _loop.ensure_isolated_tmux_targets = globals()["ensure_isolated_tmux_targets"]
+    _loop.cleanup_isolated_tmux_sessions = globals()["cleanup_isolated_tmux_sessions"]
 
     _commands_core.send_tmux_prompt = globals()["send_tmux_prompt"]
+    _commands_core.cleanup_isolated_tmux_sessions = globals()["cleanup_isolated_tmux_sessions"]
     _review_workflow.send_tmux_prompt = globals()["send_tmux_prompt"]
 
 

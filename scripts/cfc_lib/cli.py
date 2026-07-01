@@ -37,6 +37,7 @@ Usage:
 
 CfC no longer opens an interactive TUI. It is meant to be called by Codex/OMX/GJC/other plugin adapters.
 Core loop: executor adapter -> git/check evidence -> independent reviewer adapter -> repair -> learn.
+Lightweight hooks can also inject bounded global CFC memory and promote explicit safe ambient learn signals without starting a loop.
 Tracked config: `{TRACKED_CONFIG_FILE}` can define command-mode executor/reviewer profiles.
 """)
 
@@ -260,12 +261,12 @@ def build_parser() -> argparse.ArgumentParser:
     hook = sub.add_parser("hook", help="Thin hook shim for routing and recursive-assurance guards")
     hook_sub = hook.add_subparsers(dest="hook_cmd", required=True)
 
-    sp = hook_sub.add_parser("user-prompt-submit", help="Emit strict CFC router context only for explicit CFC prompts")
+    sp = hook_sub.add_parser("user-prompt-submit", help="Emit strict CFC router context for explicit CFC prompts, or bounded global memory for normal prompts")
     add_root(sp)
     sp.add_argument("--json", action="store_true", help="Emit machine-readable hook decision JSON")
     sp.set_defaults(func=cmd_hook_user_prompt_submit)
 
-    sp = hook_sub.add_parser("stop", help="Block stopping when an active CFC run is unresolved")
+    sp = hook_sub.add_parser("stop", help="Block stopping when an active CFC run is unresolved; otherwise capture safe ambient global learn signals")
     add_root(sp)
     sp.add_argument("--json", action="store_true", help="Emit machine-readable hook decision JSON")
     sp.set_defaults(func=cmd_hook_stop)

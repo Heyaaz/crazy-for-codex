@@ -25,7 +25,7 @@ from .paths import cfc_path, current_file, ensure_cfc, root_path, runs_dir, wiki
 from .prompts import render_check, render_precheck, render_task
 from .quality_gate import require_quality_gate, write_quality_gate
 from .state import active_run, current_active_run_or_none
-from .tmux_ops import send_tmux_prompt
+from .tmux_ops import cleanup_isolated_tmux_sessions, send_tmux_prompt
 
 def cmd_init(args: argparse.Namespace) -> None:
     root = root_path(args)
@@ -428,6 +428,7 @@ Review CHECK.md and commit manually if the result is acceptable.
     run["status"] = "done"
     run["completed_at"] = now_iso()
     write_json(rd / "RUN.json", run)
+    cleanup_isolated_tmux_sessions(run, rd, reason="done", force=True)
     write_json(current_file(root), {"run_id": None, "last_run_id": run["id"], "updated_at": now_iso()})
     append_ledger(rd, "done", "done", forced=args.force, verdict=verdict)
     print(done)

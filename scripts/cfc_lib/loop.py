@@ -26,7 +26,7 @@ from .review_result import extract_review_result_name, is_review_infrastructure_
 from .review_workflow import classify_review_file, run_agent_command
 from .runtime_env import enforce_external_terminal_for_live_adapters
 from .state import active_run
-from .tmux_ops import ensure_isolated_tmux_targets, render_reviewer_timeout_result, send_tmux_prompt, tmux_capture, wait_for_tmux_verdict
+from .tmux_ops import cleanup_isolated_tmux_sessions, ensure_isolated_tmux_targets, render_reviewer_timeout_result, send_tmux_prompt, tmux_capture, wait_for_tmux_verdict
 
 def next_available_path(path: Path) -> Path:
     if not path.exists():
@@ -171,6 +171,7 @@ def run_executor_command_attempts(args: argparse.Namespace, prompt: str, root: P
     run["status"] = "execute_failed"
     run.setdefault("runner", {})["executor_failures"] = failures
     write_json(rd / "RUN.json", run)
+    cleanup_isolated_tmux_sessions(run, rd, reason="execute_failed", force=True)
     raise SystemExit(failures[-1]["exit_code"] if failures else 1)
 
 def cmd_gjc(args: argparse.Namespace) -> None:
@@ -202,11 +203,13 @@ def continue_after_executor_capture(root: Path, run: dict[str, Any], rd: Path, i
         run["review"] = {"verdict": "REVIEW_BLOCKED", "blockers": blockers, "review_file": None, "classified_at": now_iso()}
         run.pop("awaiting", None)
         write_json(rd / "RUN.json", run)
+        cleanup_isolated_tmux_sessions(run, rd, reason="check_failed_no_review", force=True)
         append_ledger(rd, "async_loop", "check_failed_no_review", iteration=iteration, blocker_count=len(blockers))
         print("CfC check failed and review_on_check_fail is disabled. Inspect BLOCKERS.md.")
         return
     gated = maybe_apply_review_risk_gate(root, run, rd, iteration)
     if gated is not None:
+        cleanup_isolated_tmux_sessions(run, rd, reason="review_risk_gate", force=True)
         print(f"CfC reviewer risk-gate skipped reviewer: {run['review']['reason']}")
         return
     review_prompt = render_review_prompt(run, root, rd, iteration)
@@ -234,6 +237,7 @@ def continue_after_review_classification(root: Path, run: dict[str, Any], rd: Pa
     """After async review, either stop on pass or send BLOCKERS back to executor for repair."""
     blockers = parsed.get("blockers", [])
     if parsed.get("verdict") != "REVIEW_BLOCKED" and not blockers:
+        cleanup_isolated_tmux_sessions(run, rd, reason="review_pass", force=True)
         append_ledger(rd, "async_loop", "review_pass", iteration=iteration)
         print("CfC review passed. Run `cfc done --root ...` to finalize.")
         return
@@ -241,6 +245,7 @@ def continue_after_review_classification(root: Path, run: dict[str, Any], rd: Pa
         run["status"] = "review_blocked"
         run.pop("awaiting", None)
         write_json(rd / "RUN.json", run)
+        cleanup_isolated_tmux_sessions(run, rd, reason="review_incomplete", force=True)
         append_ledger(rd, "async_loop", "review_incomplete", iteration=iteration, blocker_count=len(blockers))
         print("CfC review did not complete cleanly. Inspect REVIEW.iteration-*.md and rerun review after fixing reviewer scope/timeout.")
         return
@@ -248,6 +253,7 @@ def continue_after_review_classification(root: Path, run: dict[str, Any], rd: Pa
     if iteration >= max_iterations:
         run["status"] = "review_blocked"
         write_json(rd / "RUN.json", run)
+        cleanup_isolated_tmux_sessions(run, rd, reason="review_blocked_max_iterations", force=True)
         append_ledger(rd, "async_loop", "review_blocked", iteration=iteration, blocker_count=len(blockers), max_iterations=max_iterations)
         print("CfC review blocked and max iterations reached. Inspect BLOCKERS.md and LEARN.md.")
         return
@@ -447,11 +453,13 @@ def cmd_loop(args: argparse.Namespace) -> None:
         if blockers and is_review_infrastructure_blocker(blockers):
             run["status"] = "review_blocked"
             write_json(rd / "RUN.json", run)
+            cleanup_isolated_tmux_sessions(run, rd, reason="review_incomplete", force=True)
             append_ledger(rd, "loop", "review_incomplete", iteration=iteration, blocker_count=len(blockers))
             break
         if iteration >= args.max_iterations:
             run["status"] = "review_blocked"
             write_json(rd / "RUN.json", run)
+            cleanup_isolated_tmux_sessions(run, rd, reason="review_blocked_max_iterations", force=True)
             append_ledger(rd, "loop", "review_blocked", iteration=iteration, blocker_count=len(blockers))
             break
         repair_prompt = render_repair_prompt(run, root, rd, iteration, blockers or run.get("check", {}).get("failures", []))
@@ -467,6 +475,8 @@ def cmd_loop(args: argparse.Namespace) -> None:
         cmd_done(argparse.Namespace(root=str(root), force=False, apply_learn=args.apply_learn))
     else:
         cmd_learn(argparse.Namespace(root=str(root), apply=args.apply_learn))
+        run, rd = active_run(root)
+        cleanup_isolated_tmux_sessions(run, rd, reason="loop_failed_or_blocked", force=True)
         print("CfC loop ended review_blocked/failed. Inspect BLOCKERS.md and run artifacts.")
 
 def default_loop_namespace(request: str, root: str = ".", replace: bool = False, allow_dirty: bool = False, budget: str | None = None) -> argparse.Namespace:

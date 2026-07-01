@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import shlex
 import subprocess
 import sys
@@ -24,6 +25,30 @@ from .review_result import latest_review_result, parse_review_result
 from .state import active_run
 from .tmux_ops import send_tmux_prompt
 
+def terminate_process_group(proc: subprocess.Popen[str], grace_seconds: float = 2.0) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        proc.terminate()
+    try:
+        proc.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except OSError:
+        proc.kill()
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def run_agent_command(command: str, prompt: str, cwd: Path, timeout: int) -> subprocess.CompletedProcess[str]:
     if command_looks_like_gjc_rpc(command):
         return run_gjc_rpc_command(command, prompt, cwd, timeout)
@@ -35,8 +60,32 @@ def run_agent_command(command: str, prompt: str, cwd: Path, timeout: int) -> sub
             prompt_file = Path(f.name)
         command = command.replace("{prompt_file}", shlex.quote(str(prompt_file)))
         stdin = None
+    proc: subprocess.Popen[str] | None = None
     try:
-        return subprocess.run(command, cwd=str(cwd), input=stdin, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True, timeout=timeout)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(cwd),
+            stdin=subprocess.PIPE if stdin is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(input=stdin, timeout=timeout)
+            return subprocess.CompletedProcess(command, proc.returncode, stdout or "", stderr or "")
+        except subprocess.TimeoutExpired:
+            terminate_process_group(proc)
+            stdout, stderr = proc.communicate()
+            stdout = stdout or ""
+            stderr = stderr or ""
+            timeout_msg = f"command timed out after {timeout} seconds"
+            stderr = (stderr + "\n" if stderr else "") + timeout_msg
+            return subprocess.CompletedProcess(command, 124, stdout, stderr)
+        except KeyboardInterrupt:
+            terminate_process_group(proc)
+            raise
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
         stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")

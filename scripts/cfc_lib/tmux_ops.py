@@ -16,6 +16,10 @@ from typing import Any
 
 from .common import append_ledger, now_iso, sha256_text, slugify, write_json
 
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "") in {"1", "true", "True", "yes", "on"}
+
 def tmux_send(target: str, text: str) -> None:
     # paste-buffer is safer than send-keys for multiline prompts.
     # Use load-buffer via stdin instead of `set-buffer <text>` so large CfC
@@ -40,6 +44,7 @@ def send_tmux_prompt(run: dict[str, Any], rd: Path, ledger_phase: str, target: s
         }
         write_json(rd / "RUN.json", run)
         append_ledger(rd, ledger_phase, "fail", target=target, error=str(exc), **fields)
+        cleanup_isolated_tmux_sessions(run, rd, reason=f"{ledger_phase}_failed", force=True)
         raise SystemExit(f"Failed to send {ledger_phase} prompt to tmux target {target}: {exc}") from exc
     append_ledger(rd, ledger_phase, "sent", target=target, **fields)
 
@@ -117,3 +122,56 @@ def ensure_isolated_tmux_targets(root: Path, run: dict[str, Any], rd: Path) -> t
     write_json(rd / "RUN.json", run)
     append_ledger(rd, "tmux_isolated", "ready", executor_target=executor_target, reviewer_target=reviewer_target)
     return executor_target, reviewer_target
+
+
+def tmux_kill_session(session: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["tmux", "kill-session", "-t", session], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+def cleanup_isolated_tmux_sessions(run: dict[str, Any], rd: Path, reason: str, force: bool = False) -> list[dict[str, Any]]:
+    """Kill CFC-owned isolated tmux sessions once they are no longer awaited.
+
+    User-provided targets such as ``gjc:0.0`` are not touched. Only sessions
+    created by ``ensure_isolated_tmux_targets`` are eligible.
+    """
+    runner = run.get("runner") if isinstance(run.get("runner"), dict) else {}
+    if not runner.get("isolated_tmux"):
+        return []
+    if _env_truthy("CFC_KEEP_ISOLATED_TMUX"):
+        append_ledger(rd, "tmux_isolated_cleanup", "skipped", reason=reason, keep_env=True)
+        return []
+    if run.get("awaiting") and not force:
+        append_ledger(rd, "tmux_isolated_cleanup", "skipped", reason=reason, awaiting=run.get("awaiting"))
+        return []
+    if runner.get("isolated_tmux_cleaned_at"):
+        return []
+
+    sessions: list[str] = []
+    for key in ["executor_session", "reviewer_session"]:
+        value = runner.get(key)
+        if isinstance(value, str) and value and value not in sessions:
+            sessions.append(value)
+
+    results: list[dict[str, Any]] = []
+    for session in sessions:
+        res = tmux_kill_session(session)
+        result = {
+            "session": session,
+            "exit_code": res.returncode,
+            "stderr": (res.stderr or "").strip(),
+        }
+        results.append(result)
+        append_ledger(
+            rd,
+            "tmux_isolated_cleanup",
+            "done" if res.returncode == 0 else "miss",
+            reason=reason,
+            session=session,
+            exit_code=res.returncode,
+            stderr=result["stderr"],
+        )
+    runner["isolated_tmux_cleaned_at"] = now_iso()
+    runner["isolated_tmux_cleanup_reason"] = reason
+    runner["isolated_tmux_cleanup"] = results
+    write_json(rd / "RUN.json", run)
+    return results

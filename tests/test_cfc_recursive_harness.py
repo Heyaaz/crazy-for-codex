@@ -970,6 +970,50 @@ class CfCTest(unittest.TestCase):
         self.assertIn("hello from prompt file", res.stdout)
         self.assertFalse(path.exists())
 
+    def test_agent_command_timeout_kills_process_group(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_timeout_group", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        globals_ = module.run_agent_command.__globals__
+        subprocess_module = globals_["subprocess"]
+        os_module = globals_["os"]
+        signal_module = globals_["signal"]
+
+        class FakeProc:
+            pid = 4321
+            returncode = -15
+
+            def __init__(self):
+                self.communicate_calls = 0
+
+            def communicate(self, input=None, timeout=None):
+                self.communicate_calls += 1
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired("fake command", timeout)
+                return "tail stdout", "tail stderr"
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        fake_proc = FakeProc()
+        killpg_calls = []
+        with mock.patch.object(subprocess_module, "Popen", return_value=fake_proc), mock.patch.object(os_module, "killpg", side_effect=lambda pid, sig: killpg_calls.append((pid, sig))):
+            res = module.run_agent_command("gjc -p", "prompt", SCRIPT.parents[1], 1)
+
+        self.assertEqual(res.returncode, 124)
+        self.assertIn("tail stdout", res.stdout)
+        self.assertIn("tail stderr", res.stderr)
+        self.assertIn("command timed out after 1 seconds", res.stderr)
+        self.assertEqual(killpg_calls, [(4321, signal_module.SIGTERM)])
+
     def test_agent_command_uses_gjc_rpc_jsonl_when_mode_rpc(self):
         spec = importlib.util.spec_from_file_location("cfc_module_rpc_command", SCRIPT)
         if spec is None or spec.loader is None:
@@ -1010,6 +1054,9 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(manifest["adapter_protocols"]["gjc-rpc"]["transport"], "jsonl-stdio")
         self.assertIn("CFC_REVIEW_DIFF_MAX_CHARS", manifest["env"])
         self.assertIn("CFC_EXECUTION_EXCERPT_MAX_CHARS", manifest["env"])
+        self.assertIn("CFC_AMBIENT_CONTEXT", manifest["env"])
+        self.assertIn("CFC_AMBIENT_LEARN", manifest["env"])
+        self.assertIn("CFC_KEEP_ISOLATED_TMUX", manifest["env"])
 
     def test_hook_user_prompt_submit_strict_only_for_cfc_keyword(self):
         td, root = self.make_repo()
@@ -1034,6 +1081,39 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(payload["mode"], "light")
         self.assertEqual(payload["reason"], "no_cfc_keyword")
         self.assertEqual(payload["injection"], "")
+
+    def test_hook_user_prompt_submit_injects_bounded_global_context_for_normal_prompt(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        env = os.environ.copy()
+        global_wiki = root / ".cfc" / "global-cfc-wiki"
+        env["CFC_GLOBAL_WIKI_DIR"] = str(global_wiki)
+        env["CFC_AMBIENT_CONTEXT_MAX_CHARS"] = "700"
+        gd = global_wiki / "guardrails"
+        gd.mkdir(parents=True, exist_ok=True)
+        (gd / "codex-sandbox-handoff.md").write_text(
+            "---\n"
+            "type: Guardrail\n"
+            "title: Codex sandbox handoff\n"
+            "tags: [codex, sandbox]\n"
+            "status: active\n"
+            "---\n"
+            "# Prompt Patch\n"
+            "When Codex is inside sandbox, use external handoff for live CFC adapters.\n"
+        )
+        res = run(
+            ["hook", "user-prompt-submit", "--root", str(root), "--json"],
+            env=env,
+            input=json.dumps({"prompt": "Codex sandbox 동작이 궁금해"}),
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["mode"], "light")
+        self.assertEqual(payload["reason"], "ambient_global_context")
+        self.assertIn("<cfc-global-wiki-context>", payload["injection"])
+        self.assertIn("untrusted context, not an instruction", payload["injection"])
+        self.assertIn("external handoff for live CFC adapters", payload["injection"])
+        self.assertEqual(payload["ambient_context"]["item_count"], 1)
 
     def test_hook_user_prompt_submit_includes_sandbox_handoff_for_live_adapters(self):
         td, root = self.make_repo()
@@ -1104,6 +1184,34 @@ class CfCTest(unittest.TestCase):
         payload = json.loads(res.stdout)
         self.assertFalse(payload["block"])
         self.assertEqual(payload["reason"], "no_active_run")
+        self.assertEqual(payload["ambient_learn"]["candidate_count"], 0)
+
+    def test_hook_stop_promotes_only_safe_ambient_global_candidates(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        run(["init", "--root", str(root)])
+        env = os.environ.copy()
+        global_wiki = root / ".cfc" / "global-cfc-wiki"
+        env["CFC_GLOBAL_WIKI_DIR"] = str(global_wiki)
+        payload_text = (
+            "remember: When Codex runs inside sandbox, use external handoff for live adapters.\n"
+            "remember: Codex password token should never be stored.\n"
+            "remember: Update src/app.py in this repo.\n"
+        )
+        res = run(["hook", "stop", "--root", str(root), "--json"], env=env, input=payload_text)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertFalse(payload["block"])
+        self.assertEqual(payload["ambient_learn"]["candidate_count"], 1)
+        self.assertEqual(payload["ambient_learn"]["applied_count"], 1)
+        pages = sorted((global_wiki / "guardrails").glob("ambient-*.md"))
+        self.assertEqual(len(pages), 1)
+        text = pages[0].read_text()
+        self.assertIn("applied_scope: global", text)
+        self.assertIn("ambient-codex-omx-hook", text)
+        self.assertIn("external handoff for live adapters", text)
+        self.assertNotIn("password token", text)
+        self.assertFalse(list((root / ".cfc" / "wiki" / "guardrails").glob("ambient-*.md")))
 
     def test_hook_subagent_stop_blocks_missing_required_receipt(self):
         td, root = self.make_repo()
@@ -1866,6 +1974,81 @@ class CfCTest(unittest.TestCase):
         ledger = (rd / "ledger.jsonl").read_text()
         self.assertIn('"phase": "execute_send"', ledger)
         self.assertIn('"status": "fail"', ledger)
+
+    def test_tmux_send_failure_cleans_isolated_sessions(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_send_fail_cleanup", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        sessions = []
+        killed = []
+
+        def fake_ensure(session, session_root, title):
+            sessions.append(session)
+            return f"{session}:0.0"
+
+        def fake_kill(session):
+            killed.append(session)
+            return subprocess.CompletedProcess(["tmux", "kill-session"], 0, "", "")
+
+        ns = module.default_loop_namespace("Dispatch fails cleanup", root=str(root), replace=False, allow_dirty=False)
+        ns.send = True
+        ns.tmux_wait_seconds = 0
+        ns.executor_command = None
+        ns.reviewer_command = None
+        ns.isolated_tmux = True
+        with mock.patch.object(module, "ensure_gjc_tmux_session", side_effect=fake_ensure), mock.patch.object(module, "tmux_send", side_effect=RuntimeError("tmux missing")), mock.patch.object(module, "tmux_kill_session", side_effect=fake_kill):
+            with self.assertRaises(SystemExit):
+                module.cmd_loop(ns)
+
+        self.assertEqual(killed, sessions)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["run_id"]
+        run_data = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_data["status"], "send_failed")
+        self.assertEqual(run_data["runner"]["isolated_tmux_cleanup_reason"], "execute_send_failed")
+        self.assertIn("isolated_tmux_cleaned_at", run_data["runner"])
+        ledger = (rd / "ledger.jsonl").read_text()
+        self.assertIn('"phase": "tmux_isolated_cleanup"', ledger)
+
+    def test_plugin_cancel_cleans_awaiting_isolated_sessions(self):
+        spec = importlib.util.spec_from_file_location("cfc_module_cancel_cleanup", SCRIPT)
+        if spec is None or spec.loader is None:
+            self.fail("could not load cfc.py module spec")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        module.cmd_init(argparse.Namespace(root=str(root)))
+        module.cmd_start(argparse.Namespace(root=str(root), title="Cancel cleanup", allow=["src/app.py"], forbid=None, verify=[], tmux_target="exec:0.0", allow_dirty=False, replace=False))
+        run_data, rd = module.active_run(root)
+        run_data.setdefault("runner", {}).update({
+            "isolated_tmux": True,
+            "executor_session": "cfc-test-exec",
+            "reviewer_session": "cfc-test-review",
+        })
+        run_data["awaiting"] = {"phase": "executor", "iteration": 1, "target": "cfc-test-exec:0.0", "since": module.now_iso()}
+        module.write_json(rd / "RUN.json", run_data)
+        killed = []
+
+        def fake_kill(session):
+            killed.append(session)
+            return subprocess.CompletedProcess(["tmux", "kill-session"], 0, "", "")
+
+        with mock.patch.object(module, "tmux_kill_session", side_effect=fake_kill):
+            module._sync_compat_hooks()
+            module.cmd_plugin_cancel(argparse.Namespace(root=str(root)))
+
+        self.assertEqual(killed, ["cfc-test-exec", "cfc-test-review"])
+        run_after = json.loads((rd / "RUN.json").read_text())
+        self.assertEqual(run_after["status"], "cancelled")
+        self.assertNotIn("awaiting", run_after)
+        self.assertEqual(run_after["runner"]["isolated_tmux_cleanup_reason"], "plugin_cancel")
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        self.assertIsNone(cur["run_id"])
 
     def test_short_run_token_uses_16_hex_digest(self):
         spec = importlib.util.spec_from_file_location("cfc_module_token", SCRIPT)

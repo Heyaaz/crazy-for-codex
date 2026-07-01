@@ -22,6 +22,7 @@ from .loop import cmd_loop, default_loop_namespace
 from .paths import cfc_path, current_file, root_path
 from .runtime_env import external_terminal_handoff_payload
 from .state import active_run, current_active_run_or_none
+from .tmux_ops import cleanup_isolated_tmux_sessions
 
 def run_summary(root: Path) -> dict[str, Any]:
     if not is_git_repo(root):
@@ -97,12 +98,15 @@ def cmd_plugin_manifest(args: argparse.Namespace) -> None:
         "env": [
             "CFC_EXECUTOR_COMMAND", "CFC_REVIEWER_COMMAND", "CFC_EXECUTOR_TARGET", "CFC_REVIEWER_TARGET",
             "CFC_SEND", "CFC_TMUX_WAIT_SECONDS", "CFC_MAX_ITERATIONS", "CFC_APPLY_LEARN", "CFC_ISOLATED_TMUX",
+            "CFC_KEEP_ISOLATED_TMUX",
             "CFC_DONE_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_AUTO_APPLY_HIGH_LEARN", "CFC_REVIEW_ON_CHECK_FAIL",
             "CFC_REVIEW_POLL_SECONDS", "CFC_REVIEW_WAIT_TIMEOUT_SECONDS", "CFC_ALLOW_SANDBOX_LIVE_ADAPTERS",
             "CFC_BUDGET", "CFC_CAPTURE_LINES", "CFC_WIKI_CONTEXT_MAX_CHARS", "CFC_REVIEW_RISK_GATE",
             "CFC_REVIEW_DIFF_MAX_CHARS", "CFC_REVIEW_UNTRACKED_FILE_MAX_CHARS",
             "CFC_EXECUTION_EXCERPT_MAX_CHARS", "CFC_EXECUTION_EXCERPT_TAIL_LINES",
             "CFC_GLOBAL_DIR", "CFC_GLOBAL_WIKI_DIR", "CFC_GLOBAL_WIKI_CONTEXT_MAX_CHARS",
+            "CFC_AMBIENT_CONTEXT", "CFC_AMBIENT_CONTEXT_MAX_CHARS", "CFC_AMBIENT_LEARN",
+            "CFC_AMBIENT_LEARN_MAX_CHARS",
         ],
     }
     print(json.dumps(manifest, indent=2, ensure_ascii=False))
@@ -133,6 +137,7 @@ def cmd_plugin_cancel(args: argparse.Namespace) -> None:
     run["cancelled_at"] = run["completed_at"]
     run.pop("awaiting", None)
     write_json(rd / "RUN.json", run)
+    cleanup_isolated_tmux_sessions(run, rd, reason="plugin_cancel", force=True)
     write_json(current_file(root), {"run_id": None, "last_run_id": run["id"], "updated_at": now_iso(), "cancelled": True})
     append_ledger(rd, "cancel", "cancelled")
     print(json.dumps({"cancelled": True, "run_id": run.get("id"), "run_dir": str(rd)}, indent=2, ensure_ascii=False))

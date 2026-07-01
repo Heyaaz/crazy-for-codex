@@ -71,7 +71,7 @@ def read_source_artifacts(rd: Path) -> tuple[str, str, list[dict[str, str]]]:
 SENSITIVE_RE = re.compile(r"\b(secret|password|passwd|token|api[_ -]?key|credential|private[_ -]?key|endpoint|customer|client)\b", re.IGNORECASE)
 REPO_SPECIFIC_RE = re.compile(r"(?<![\w.-])(?:src|app|backend|frontend|tests?|packages?)/|(?:package\.json|pyproject\.toml|pom\.xml|build\.gradle)\b", re.IGNORECASE)
 GLOBAL_OPERATIONAL_RE = re.compile(
-    r"\b(cfc|codex|sandbox|tmux|gjc|reviewer|verification|evidence|receipt|prompt|diff|capture|allowed paths|forbidden|blocker|done\.md|scope)\b",
+    r"\b(cfc|codex|omx|sandbox|tmux|gjc|reviewer|verification|evidence|receipt|prompt|diff|capture|allowed paths|forbidden|blocker|done\.md|scope|wiki|hook|session|subagent|compact|learn|memory)\b",
     re.IGNORECASE,
 )
 
@@ -331,7 +331,9 @@ def apply_candidates(root: Path, run: dict[str, Any], candidates: list[dict[str,
             continue
         tags = sorted({"cfc", "gjc", *re.findall(r"[a-z0-9][a-z0-9_-]*", (c["title"] + " " + run["title"]).lower())})
         source_artifacts = c.get("source_artifacts") or []
-        source_run = f"../runs/{run['id']}" if target_scope == "repo" else str(Path(run["repo"]) / ".cfc" / "runs" / run["id"])
+        source_run = str(run.get("source_ref") or (
+            f"../runs/{run['id']}" if target_scope == "repo" else str(Path(run["repo"]) / ".cfc" / "runs" / run["id"])
+        ))
         path.write_text(f"""---
 type: {c['type']}
 title: {c['title']}
