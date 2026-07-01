@@ -37,8 +37,9 @@ def resolve_budget(name: str | None = None, config: dict[str, Any] | None = None
 
     Precedence: explicit `name` (CLI ``--budget``) > ``CFC_BUDGET`` env var >
     config ``budget`` > :data:`DEFAULT_BUDGET`. Per-key env overrides
-    (``CFC_WIKI_CONTEXT_MAX_CHARS``, ``CFC_CAPTURE_LINES``, and
-    ``CFC_REVIEW_RISK_GATE``) still win over preset values at call sites.
+    (``CFC_WIKI_CONTEXT_MAX_CHARS``, ``CFC_CAPTURE_LINES``,
+    ``CFC_REVIEW_RISK_GATE``, review diff limits, and executor excerpt
+    limits) still win over preset values at call sites.
     """
     return dict(BUDGET_PRESETS[budget_name(name, config)])
 

@@ -922,6 +922,8 @@ class CfCTest(unittest.TestCase):
         self.assertIn("run", manifest["commands"])
         self.assertIn("status", manifest["commands"])
         self.assertEqual(manifest["adapter_protocols"]["gjc-rpc"]["transport"], "jsonl-stdio")
+        self.assertIn("CFC_REVIEW_DIFF_MAX_CHARS", manifest["env"])
+        self.assertIn("CFC_EXECUTION_EXCERPT_MAX_CHARS", manifest["env"])
 
     def test_hook_user_prompt_submit_strict_only_for_cfc_keyword(self):
         td, root = self.make_repo()
@@ -976,6 +978,7 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(payload["mode"], "strict")
         self.assertTrue(payload["handoff"]["handoff_required"])
         self.assertIn("Codex App external-terminal handoff", payload["injection"])
+        self.assertIn("env -u CODEX_SANDBOX cfc plugin run", payload["injection"])
         self.assertIn("--handoff-only", payload["injection"])
         self.assertIn("Do not run `cfc plugin run` directly", payload["injection"])
 
@@ -1075,6 +1078,7 @@ class CfCTest(unittest.TestCase):
         payload = json.loads(res.stdout)
         self.assertEqual(payload["status"], "handoff_only")
         self.assertTrue(payload["handoff_required"])
+        self.assertIn("env -u CODEX_SANDBOX cfc plugin run", payload["external_command"])
         self.assertIn("cfc plugin run", payload["external_command"])
         self.assertIn("gjc -p --model", json.dumps(payload["live_adapter_attempts"]))
         self.assertFalse((root / ".cfc").exists())
@@ -1288,6 +1292,7 @@ class CfCTest(unittest.TestCase):
         self.assertEqual(payload["status"], "handoff_required")
         self.assertTrue(payload["handoff_required"])
         self.assertEqual(payload["reason"], "codex_app_sandbox_live_adapters")
+        self.assertIn("env -u CODEX_SANDBOX cfc plugin run", payload["external_command"])
         self.assertIn("cfc plugin run", payload["external_command"])
         self.assertIn("--executor-profile glm", payload["external_command"])
         self.assertIn("--reviewer-profile codex", payload["external_command"])
