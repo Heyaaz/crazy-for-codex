@@ -147,14 +147,39 @@ def git_diff(root: Path) -> str:
     code, out, err = git_output(root, "diff")
     return out if code == 0 else err
 
-def git_review_diff(root: Path, max_file_chars: int = 20000) -> str:
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def _bounded_text(text: str, max_chars: int, marker: str) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    head_chars = max(0, max_chars // 2)
+    tail_chars = max(0, max_chars - head_chars)
+    return text[:head_chars].rstrip() + f"\n...<{marker}: {len(text) - max_chars} chars omitted>...\n" + text[-tail_chars:].lstrip()
+
+
+def git_review_diff(root: Path, max_file_chars: int | None = None, max_diff_chars: int | None = None) -> str:
+    if max_file_chars is None:
+        max_file_chars = _env_int("CFC_REVIEW_UNTRACKED_FILE_MAX_CHARS", 12000, minimum=1000)
+    if max_diff_chars is None:
+        max_diff_chars = _env_int("CFC_REVIEW_DIFF_MAX_CHARS", 24000, minimum=2000)
     sections: list[str] = []
     code, status, err = git_output(root, "status", "--short")
     sections.append("## Git Status\n\n```text\n" + ((status if code == 0 else err).rstrip() or "(clean)") + "\n```")
+    sections.append("## Diff Stat\n\n```text\n" + (git_diff_stat(root) or "(no diff)") + "\n```")
+    sections.append("## Changed Files\n\n```text\n" + ("\n".join(git_changed_files(root)) or "(none)") + "\n```")
+    per_diff_budget = max(1000, max_diff_chars // 2)
     code, unstaged, err = git_output(root, "diff")
-    sections.append("## Unstaged Diff\n\n```diff\n" + ((unstaged if code == 0 else err) or "(no unstaged diff)")[:50000] + "\n```")
+    unstaged_text = (unstaged if code == 0 else err) or "(no unstaged diff)"
+    sections.append("## Unstaged Diff\n\n```diff\n" + _bounded_text(unstaged_text, per_diff_budget, "truncated by CFC review diff budget") + "\n```")
     code, staged, err = git_output(root, "diff", "--cached")
-    sections.append("## Staged Diff\n\n```diff\n" + ((staged if code == 0 else err) or "(no staged diff)")[:50000] + "\n```")
+    staged_text = (staged if code == 0 else err) or "(no staged diff)"
+    sections.append("## Staged Diff\n\n```diff\n" + _bounded_text(staged_text, per_diff_budget, "truncated by CFC review diff budget") + "\n```")
     # Plain git diff omits untracked files; include small text untracked files so
     # the clean reviewer can actually inspect new files.
     code, untracked, _ = git_output(root, "ls-files", "--others", "--exclude-standard")
@@ -178,7 +203,7 @@ def git_review_diff(root: Path, max_file_chars: int = 20000) -> str:
                 continue
             text = data.decode("utf-8", errors="replace")
             truncated = len(text) > max_file_chars
-            suffix = "\n...<truncated>" if truncated else ""
+            suffix = f"\n...<truncated by CFC untracked file budget: {len(text) - max_file_chars} chars omitted>" if truncated else ""
             entries.append(f"### {rel}\n\n```text\n{text[:max_file_chars]}{suffix}\n```\n")
     sections.append("## Untracked Files\n\n" + ("\n".join(entries) if entries else "(none)"))
     return "\n\n".join(sections)

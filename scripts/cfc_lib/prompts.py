@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .common import now_iso, sha256_text, write_json
+from .common import append_ledger, now_iso, sha256_text, write_json
 from .git_ops import git_diff_stat, git_review_diff
 from .paths import runs_dir
 from .state import collect_active_wiki
@@ -315,7 +315,59 @@ def build_prompt(run: dict[str, Any], root: Path, user_request: str, mode: str =
     sections.append(user_request)
     return "\n\n".join(sections).strip() + "\n"
 
-def latest_artifact_excerpt(rd: Path, patterns: list[str], max_chars: int = 20000) -> str:
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+SIGNAL_LINE_RE = re.compile(r"\b(error|fail|failed|failure|warn|warning|exception|traceback|timeout|blocker)\b", re.IGNORECASE)
+
+
+def text_metrics(text: str) -> dict[str, Any]:
+    return {
+        "chars": len(text),
+        "lines": len(text.splitlines()),
+        "sha256": sha256_text(text),
+    }
+
+
+def excerpt_lines(text: str, *, max_chars: int, tail_lines: int) -> tuple[str, dict[str, Any]]:
+    lines = text.splitlines()
+    signal_lines = [line for line in lines if SIGNAL_LINE_RE.search(line)]
+    if len(signal_lines) > 40:
+        signal_lines = signal_lines[:20] + ["...<signal lines truncated>"] + signal_lines[-20:]
+    tail = lines[-tail_lines:] if tail_lines > 0 else []
+    excerpt = "\n".join(
+        [
+            "## Signal Lines",
+            "\n".join(signal_lines) if signal_lines else "(none)",
+            "",
+            f"## Tail ({len(tail)} lines)",
+            "\n".join(tail) if tail else "(none)",
+        ]
+    )
+    truncated = len(excerpt) > max_chars
+    if truncated:
+        keep = max_chars
+        excerpt = excerpt[:keep].rstrip() + f"\n...<truncated by CFC execution excerpt budget: {len(excerpt) - keep} chars omitted>"
+    return excerpt, {
+        "source_chars": len(text),
+        "source_lines": len(lines),
+        "excerpt_chars": len(excerpt),
+        "excerpt_lines": len(excerpt.splitlines()),
+        "signal_line_count": len(signal_lines),
+        "tail_lines": len(tail),
+        "truncated": truncated,
+    }
+
+
+def latest_artifact_excerpt(rd: Path, patterns: list[str], max_chars: int | None = None) -> str:
+    if max_chars is None:
+        max_chars = env_int("CFC_EXECUTION_EXCERPT_MAX_CHARS", 6000, minimum=1000)
+    tail_lines = env_int("CFC_EXECUTION_EXCERPT_TAIL_LINES", 80, minimum=10)
     files: list[Path] = []
     for pattern in patterns:
         files.extend(p for p in rd.glob(pattern) if p.is_file())
@@ -323,16 +375,88 @@ def latest_artifact_excerpt(rd: Path, patterns: list[str], max_chars: int = 2000
         return "(none)"
     path = sorted(files, key=lambda p: p.stat().st_mtime)[-1]
     text = path.read_text(encoding="utf-8", errors="ignore")
-    truncated = len(text) > max_chars
-    suffix = "\n...<truncated>" if truncated else ""
-    return f"Source: `{path.name}`\n\n```text\n{text[:max_chars]}{suffix}\n```"
+    excerpt, metadata = excerpt_lines(text, max_chars=max_chars, tail_lines=tail_lines)
+    return (
+        f"Source: `{path.name}`\n"
+        f"Full artifact preserved in run dir; this is a bounded excerpt for review prompt context.\n"
+        f"Original: {metadata['source_chars']} chars / {metadata['source_lines']} lines; "
+        f"excerpt: {metadata['excerpt_chars']} chars / {metadata['excerpt_lines']} lines.\n\n"
+        f"```text\n{excerpt}\n```"
+    )
+
+
+def prompt_budget_metadata(run: dict[str, Any]) -> dict[str, int]:
+    budget = run.get("budget") if isinstance(run.get("budget"), dict) else {}
+    name = str(budget.get("name") or os.environ.get("CFC_BUDGET") or DEFAULT_BUDGET)
+    if name == "strict":
+        defaults = {"review_diff_chars": 48000, "execution_excerpt_chars": 10000}
+    elif name == "light":
+        defaults = {"review_diff_chars": 16000, "execution_excerpt_chars": 4000}
+    else:
+        defaults = {"review_diff_chars": 24000, "execution_excerpt_chars": 6000}
+    return {
+        "review_diff_chars": env_int("CFC_REVIEW_DIFF_MAX_CHARS", defaults["review_diff_chars"], minimum=2000),
+        "execution_excerpt_chars": env_int("CFC_EXECUTION_EXCERPT_MAX_CHARS", defaults["execution_excerpt_chars"], minimum=1000),
+    }
+
+
+def record_review_prompt_telemetry(
+    run: dict[str, Any],
+    rd: Path,
+    iteration: int,
+    prompt: str,
+    *,
+    check_text: str,
+    executor_excerpt: str,
+    review_diff: str,
+    no_diff_fast_gate: bool,
+) -> None:
+    artifact = rd / f"REVIEW_PROMPT_TELEMETRY.iteration-{iteration}.json"
+    payload = {
+        "generated_at": now_iso(),
+        "iteration": iteration,
+        "prompt": text_metrics(prompt),
+        "components": {
+            "check_evidence": text_metrics(check_text),
+            "executor_excerpt": text_metrics(executor_excerpt),
+            "review_diff": text_metrics(review_diff),
+        },
+        "budget": prompt_budget_metadata(run),
+        "no_diff_fast_gate": no_diff_fast_gate,
+    }
+    write_json(artifact, payload)
+    run.setdefault("telemetry", {}).setdefault("review_prompts", {})[str(iteration)] = {
+        "artifact": str(artifact),
+        "prompt_chars": payload["prompt"]["chars"],
+        "review_diff_chars": payload["components"]["review_diff"]["chars"],
+        "executor_excerpt_chars": payload["components"]["executor_excerpt"]["chars"],
+    }
+    write_json(rd / "RUN.json", run)
+    append_ledger(
+        rd,
+        "prompt_telemetry",
+        "done",
+        prompt_type="review",
+        iteration=iteration,
+        path=str(artifact),
+        prompt_chars=payload["prompt"]["chars"],
+        review_diff_chars=payload["components"]["review_diff"]["chars"],
+        executor_excerpt_chars=payload["components"]["executor_excerpt"]["chars"],
+        check_chars=payload["components"]["check_evidence"]["chars"],
+    )
 
 def render_review_prompt(run: dict[str, Any], root: Path, rd: Path, iteration: int) -> str:
     check_text = (rd / "CHECK.md").read_text(encoding="utf-8", errors="ignore") if (rd / "CHECK.md").exists() else "(CHECK.md missing)"
-    review_diff = git_review_diff(root)
+    check_prompt_text = check_text[:20000]
+    budgets = prompt_budget_metadata(run)
+    review_diff = git_review_diff(root, max_diff_chars=budgets["review_diff_chars"])
     check = run.get("check", {}) or {}
     no_diff_fast_gate = check.get("verdict") == "PASS" and not check.get("changed_files")
-    executor_excerpt = latest_artifact_excerpt(rd, [f"EXECUTION.iteration-{iteration}.md", f"GJC_LOG.iteration-{iteration}.md", "GJC_LOG.*.md"])
+    executor_excerpt = latest_artifact_excerpt(
+        rd,
+        [f"EXECUTION.iteration-{iteration}.md", f"GJC_LOG.iteration-{iteration}.md", "GJC_LOG.*.md"],
+        max_chars=budgets["execution_excerpt_chars"],
+    )
     fast_gate = ""
     if no_diff_fast_gate:
         fast_gate = """
@@ -343,7 +467,7 @@ Fast gate for no-diff runs:
 - If those artifacts are internally consistent, return Verdict: PASS quickly.
 - If the artifacts are incomplete or contradictory, return Verdict: REVIEW_BLOCKED with the artifact gap as the blocker.
 """
-    return f"""# CfC Independent Review Prompt
+    prompt = f"""# CfC Independent Review Prompt
 
 Repository: {root}
 Run: {run['title']} ({run['id']})
@@ -387,7 +511,7 @@ Verdict: PASS or REVIEW_BLOCKED
 ## Check Evidence
 
 ```md
-{check_text[:20000]}
+{check_prompt_text}
 ```
 
 ## Executor Report Excerpt
@@ -398,6 +522,17 @@ Verdict: PASS or REVIEW_BLOCKED
 
 {review_diff}
 """
+    record_review_prompt_telemetry(
+        run,
+        rd,
+        iteration,
+        prompt,
+        check_text=check_prompt_text,
+        executor_excerpt=executor_excerpt,
+        review_diff=review_diff,
+        no_diff_fast_gate=no_diff_fast_gate,
+    )
+    return prompt
 
 def render_repair_prompt(run: dict[str, Any], root: Path, rd: Path, iteration: int, blockers: list[str]) -> str:
     blocker_text = "\n".join(f"- {b}" for b in blockers) or "- none"

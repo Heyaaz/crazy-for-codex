@@ -123,7 +123,7 @@ def maybe_apply_review_risk_gate(root: Path, run: dict[str, Any], rd: Path, iter
     }
     run.pop("awaiting", None)
     write_json(rd / "RUN.json", run)
-    append_ledger(rd, "review_risk_gate", "skipped_reviewer", iteration=iteration, reason=reason, review_file=str(review_path))
+    append_ledger(rd, "review_risk_gate", "skipped_reviewer", iteration=iteration, reason=reason, review_file=str(review_path), reviewer_invoked=False)
     return parsed
 
 def run_executor_command_attempts(args: argparse.Namespace, prompt: str, root: Path, rd: Path, run: dict[str, Any], iteration: int) -> None:
@@ -179,7 +179,7 @@ def cmd_gjc(args: argparse.Namespace) -> None:
     prompt = build_prompt(run, root, args.request, mode="execute")
     p = rd / f"PROMPT.iteration-{args.iteration}.md"
     p.write_text(prompt, encoding="utf-8")
-    append_ledger(rd, "prompt", "done", iteration=args.iteration, path=str(p), sha256=sha256_text(prompt))
+    append_ledger(rd, "prompt", "done", iteration=args.iteration, path=str(p), sha256=sha256_text(prompt), prompt_chars=len(prompt), prompt_lines=len(prompt.splitlines()))
     print(f"Wrote prompt: {p}")
     if args.send:
         target = args.tmux_target or run.get("runner", {}).get("target") or "gjc:0.0"
@@ -212,13 +212,13 @@ def continue_after_executor_capture(root: Path, run: dict[str, Any], rd: Path, i
     review_prompt = render_review_prompt(run, root, rd, iteration)
     review_prompt_path = rd / f"REVIEW_PROMPT.iteration-{iteration}.md"
     review_prompt_path.write_text(review_prompt, encoding="utf-8")
-    append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path))
+    append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path), prompt_chars=len(review_prompt), prompt_lines=len(review_prompt.splitlines()))
     reviewer_target = run.get("runner", {}).get("reviewer_target") or os.environ.get("CFC_REVIEWER_TARGET")
     if reviewer_target:
         send_tmux_prompt(run, rd, "review_send", reviewer_target, review_prompt, iteration=iteration)
         run["awaiting"] = {"phase": "reviewer", "iteration": iteration, "target": reviewer_target, "prompt": str(review_prompt_path), "since": now_iso()}
         write_json(rd / "RUN.json", run)
-        append_ledger(rd, "async_loop", "waiting_for_reviewer", iteration=iteration, target=reviewer_target)
+        append_ledger(rd, "async_loop", "waiting_for_reviewer", iteration=iteration, target=reviewer_target, reviewer_invoked=True)
         print(f"CfC dispatched reviewer prompt to {reviewer_target} after executor capture.")
     else:
         # No external reviewer target is configured, so the review prompt was
@@ -373,7 +373,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
                 prompt = prompt_path.read_text(encoding="utf-8")
         if not prompt_path.exists():
             prompt_path.write_text(prompt, encoding="utf-8")
-        append_ledger(rd, "execute_prompt", "done", iteration=iteration, path=str(prompt_path))
+        append_ledger(rd, "execute_prompt", "done", iteration=iteration, path=str(prompt_path), prompt_chars=len(prompt), prompt_lines=len(prompt.splitlines()))
         if args.executor_command:
             run_executor_command_attempts(args, prompt, root, rd, run, iteration)
         elif args.send:
@@ -403,7 +403,7 @@ def cmd_loop(args: argparse.Namespace) -> None:
                 review_prompt = render_review_prompt(run, root, rd, iteration)
                 review_prompt_path = rd / f"REVIEW_PROMPT.iteration-{iteration}.md"
                 review_prompt_path.write_text(review_prompt, encoding="utf-8")
-                append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path))
+                append_ledger(rd, "review_prompt", "done", iteration=iteration, path=str(review_prompt_path), prompt_chars=len(review_prompt), prompt_lines=len(review_prompt.splitlines()))
                 if args.reviewer_command:
                     res = run_agent_command(args.reviewer_command, review_prompt, root, args.timeout)
                     if res.returncode != 0:
@@ -415,13 +415,13 @@ def cmd_loop(args: argparse.Namespace) -> None:
                         )
                     else:
                         review_text = res.stdout + ("\n\n## reviewer stderr\n```text\n" + res.stderr + "\n```\n" if res.stderr else "")
-                    append_ledger(rd, "review_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode)
+                    append_ledger(rd, "review_command", "pass" if res.returncode == 0 else "fail", iteration=iteration, exit_code=res.returncode, reviewer_invoked=True)
                 elif args.send:
                     send_tmux_prompt(run, rd, "review_send", args.reviewer_target, review_prompt, iteration=iteration)
                     if not args.tmux_wait_seconds:
                         run["awaiting"] = {"phase": "reviewer", "iteration": iteration, "target": args.reviewer_target, "prompt": str(review_prompt_path), "since": now_iso()}
                         write_json(rd / "RUN.json", run)
-                        append_ledger(rd, "loop", "waiting_for_reviewer", iteration=iteration, target=args.reviewer_target)
+                        append_ledger(rd, "loop", "waiting_for_reviewer", iteration=iteration, target=args.reviewer_target, reviewer_invoked=True)
                         print(f"CfC dispatched reviewer prompt to {args.reviewer_target} and is waiting for external completion before classification.")
                         print(f"Run dir: {rd}")
                         return

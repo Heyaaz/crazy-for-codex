@@ -1452,6 +1452,74 @@ class CfCTest(unittest.TestCase):
         self.assertIn("src/new.py", prompt)
         self.assertIn("VALUE = 42", prompt)
 
+    def test_review_prompt_summarizes_executor_output_and_preserves_full_artifact(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        (root / "executor.py").write_text(
+            "import sys\n"
+            "sys.stdin.read()\n"
+            "print('ERROR critical signal line')\n"
+            "for i in range(180):\n"
+            "    print(f'MIDDLE-LINE-{i:03d}')\n"
+            "print('TAIL_MARKER final')\n"
+        )
+        (root / "reviewer.py").write_text("import sys\nsys.stdin.read()\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        res = run([
+            "loop", "--root", str(root), "Summarize executor output",
+            "--budget", "strict",
+            "--verify", "git diff --check",
+            "--executor-command", f"{sys.executable} executor.py",
+            "--reviewer-command", f"{sys.executable} reviewer.py",
+        ])
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["last_run_id"]
+        prompt = (rd / "REVIEW_PROMPT.iteration-1.md").read_text()
+        execution = (rd / "EXECUTION.iteration-1.md").read_text()
+        self.assertIn("Full artifact preserved in run dir", prompt)
+        self.assertIn("ERROR critical signal line", prompt)
+        self.assertIn("TAIL_MARKER final", prompt)
+        self.assertNotIn("MIDDLE-LINE-050", prompt)
+        self.assertIn("MIDDLE-LINE-050", execution)
+
+    def test_review_prompt_diff_budget_truncates_and_records_telemetry(self):
+        td, root = self.make_repo()
+        self.addCleanup(td.cleanup)
+        (root / "executor.py").write_text(
+            "import pathlib, sys\n"
+            "sys.stdin.read()\n"
+            "payload = '\\n'.join(f'VALUE_{i} = {i}' for i in range(600)) + '\\n'\n"
+            "pathlib.Path('src/app.py').write_text(payload)\n"
+        )
+        (root / "reviewer.py").write_text("import sys\nsys.stdin.read()\nprint('Verdict: PASS')\nprint('')\nprint('## BLOCKERS')\nprint('- none')\n")
+        subprocess.run(["git", "add", "executor.py", "reviewer.py"], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-m", "agents"], cwd=root, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = os.environ.copy()
+        env["CFC_REVIEW_DIFF_MAX_CHARS"] = "2000"
+        res = run([
+            "loop", "--root", str(root), "Bound review diff",
+            "--allow", "src/app.py",
+            "--executor-command", f"{sys.executable} executor.py",
+            "--reviewer-command", f"{sys.executable} reviewer.py",
+        ], env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        cur = json.loads((root / ".cfc" / "current.json").read_text())
+        rd = root / ".cfc" / "runs" / cur["last_run_id"]
+        prompt = (rd / "REVIEW_PROMPT.iteration-1.md").read_text()
+        telemetry = json.loads((rd / "REVIEW_PROMPT_TELEMETRY.iteration-1.json").read_text())
+        run_data = json.loads((rd / "RUN.json").read_text())
+        ledger = (rd / "ledger.jsonl").read_text()
+        self.assertIn("## Diff Stat", prompt)
+        self.assertIn("src/app.py", prompt)
+        self.assertIn("truncated by CFC review diff budget", prompt)
+        self.assertEqual(telemetry["budget"]["review_diff_chars"], 2000)
+        self.assertIn("review_diff", telemetry["components"])
+        self.assertEqual(run_data["telemetry"]["review_prompts"]["1"]["prompt_chars"], telemetry["prompt"]["chars"])
+        self.assertIn('"phase": "prompt_telemetry"', ledger)
+        self.assertIn('"prompt_chars"', ledger)
+
     def test_no_diff_review_prompt_forbids_repo_reaudit_and_tests(self):
         td, root = self.make_repo()
         self.addCleanup(td.cleanup)
